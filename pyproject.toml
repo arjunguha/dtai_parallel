@@ -19,3 +19,8 @@ dtai-parallel = "dtai_parallel:main"
 [build-system]
 requires = ["uv_build>=0.9.28,<0.10.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+norecursedirs = ["old0", "old1"]

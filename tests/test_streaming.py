@@ -14,7 +14,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 
-from cpu_streaming_ddp import CPUStreamingDataParallel, StageSpec
+from dtai_parallel import CPUStreamingDataParallel, StageSpec
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +164,8 @@ def train_streaming_model(
 
         # DDP-style contract for this abstraction: sum local losses here, then
         # let CPUStreamingDataParallel average gradients across replicas.
-        loss = sum(criterion(out, target) for out, target in zip(outputs, targets))
+        loss_device = outputs[0].device
+        loss = sum(criterion(out, target).to(loss_device) for out, target in zip(outputs, targets))
         loss.backward()
         norms.append(model.step())
 
