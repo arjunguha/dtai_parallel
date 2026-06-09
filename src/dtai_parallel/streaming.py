@@ -702,6 +702,8 @@ class _OffloadedModuleHandle:
         local_device: torch.device,
         process_group: Optional[Any],
         metrics: StreamingTransferMetrics,
+        grad_norm_type: float,
+        track_grad_norms: bool,
     ) -> None:
         self.qualified_name = qualified_name
         self.stage_index = int(stage_index)
@@ -709,6 +711,8 @@ class _OffloadedModuleHandle:
         self.local_device = local_device
         self.process_group = process_group
         self.metrics = metrics
+        self.grad_norm_type = float(grad_norm_type)
+        self.track_grad_norms = bool(track_grad_norms)
         self.module = copy.deepcopy(module).cpu()
         if self.local_device.type == "cuda":
             _pin_module_cpu_tensors_if_possible_(self.module)
@@ -720,6 +724,7 @@ class _OffloadedModuleHandle:
         self._prefetch_streams: Dict[Tuple[int, bool], torch.cuda.Stream] = {}
         self._pending_grad_copies: Dict[str, List[_PendingGradCopy]] = {}
         self._grad_copy_events: Dict[str, torch.cuda.Event] = {}
+        self._grad_norms_by_name: Dict[str, Tensor] = {}
 
     @property
     def parameters_by_name(self) -> "OrderedDict[str, nn.Parameter]":
@@ -735,6 +740,7 @@ class _OffloadedModuleHandle:
     def zero_grad(self, set_to_none: bool = True) -> None:
         self._wait_all_grad_copies()
         self._discard_pending_grad_copies()
+        self._grad_norms_by_name = {}
         for parameter in self.parameters_by_name.values():
             if set_to_none:
                 parameter.grad = None
@@ -760,6 +766,15 @@ class _OffloadedModuleHandle:
         self._grad_copy_events = {}
         for event in events:
             event.synchronize()
+
+    def _record_grad_norm(self, name: str, grad: Tensor, *, norm_type: float) -> None:
+        if not self.track_grad_norms:
+            return
+        detached = grad.detach()
+        if norm_type == float("inf"):
+            self._grad_norms_by_name[name] = detached.abs().max()
+        else:
+            self._grad_norms_by_name[name] = torch.linalg.vector_norm(detached, ord=norm_type)
 
     def broadcast_initial_state(self) -> None:
         """Make hidden CPU masters identical across ranks after random init."""
@@ -873,6 +888,7 @@ class _OffloadedModuleHandle:
                             kind="grad_accum_h2d",
                         )
                         accumulated.add_(grad_detached)
+                    self._record_grad_norm(name, accumulated, norm_type=self.grad_norm_type)
                     target.grad = _copy_tensor_to_cpu(accumulated, metrics=self.metrics, kind="grad_d2h", like=target)
                     self._record_grad_copy(name, grad_detached.device)
                 elif target.grad is None:
@@ -922,6 +938,7 @@ class _OffloadedModuleHandle:
                         kind="grad_reduce_h2d",
                     )
                     reduced = _all_reduce_mean_(staged_grad, self.local_device, self.process_group).detach()
+                    self._record_grad_norm(name, reduced, norm_type=self.grad_norm_type)
                     parameter.grad = _copy_tensor_to_cpu(reduced, metrics=self.metrics, kind="grad_reduce_d2h", like=parameter)
                     self._record_grad_copy(name, self.local_device)
             return
@@ -937,6 +954,17 @@ class _OffloadedModuleHandle:
     def offloaded_grad_norm(self, *, device: torch.device, norm_type: float) -> Optional[Tensor]:
         if device.type != "cuda":
             return _grad_total_norm((parameter.grad for parameter in self.parameters_by_name.values()), norm_type=norm_type, device=device)
+        if norm_type == self.grad_norm_type:
+            cached_norms: List[Tensor] = []
+            for name, parameter in self.parameters_by_name.items():
+                if parameter.grad is None:
+                    continue
+                cached_norm = self._grad_norms_by_name.get(name)
+                if cached_norm is None:
+                    break
+                cached_norms.append(cached_norm)
+            else:
+                return _combine_grad_norms(cached_norms, norm_type=norm_type, device=device)
         staged_grads: List[Tensor] = []
         for name, parameter in self.parameters_by_name.items():
             if parameter.grad is None:
@@ -1593,6 +1621,8 @@ def _build_streaming_container(
     local_device: torch.device,
     process_group: Optional[Any],
     metrics: StreamingTransferMetrics,
+    grad_norm_type: float,
+    track_grad_norms: bool,
 ) -> Union[CPUStreamingModuleList, CPUStreamingSequential]:
     if not isinstance(container, (nn.ModuleList, nn.Sequential)):
         raise TypeError(
@@ -1614,6 +1644,8 @@ def _build_streaming_container(
                 local_device=local_device,
                 process_group=process_group,
                 metrics=metrics,
+                grad_norm_type=grad_norm_type,
+                track_grad_norms=track_grad_norms,
             )
             stage = _StreamingStage(
                 display_name=qualified_name,
@@ -1709,6 +1741,8 @@ def apply_cpu_streaming_(
         local_device=local_device,
         process_group=process_group,
         metrics=metrics,
+        grad_norm_type=grad_norm_type,
+        track_grad_norms=max_grad_norm is not None,
     )
     _set_module_path(parent, child_name, streaming_container)
 
