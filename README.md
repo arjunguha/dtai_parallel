@@ -94,6 +94,20 @@ engine = apply_cpu_streaming_(
 )
 ```
 
+Use `resident_suffix_count` to force a trailing suffix of the transformed list to
+stay resident regardless of the offload policy:
+
+```python
+engine = apply_cpu_streaming_(
+    model,
+    "decoder.layers",
+    offload_policy=True,
+    resident_suffix_count=4,  # offload all but the last four decoder blocks
+    optimizer_cls=torch.optim.AdamW,
+    optimizer_kwargs={"lr": 3e-4, "foreach": False},
+)
+```
+
 ## Tests
 
 Run the suite with:

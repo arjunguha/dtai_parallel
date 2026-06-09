@@ -192,6 +192,12 @@ def assert_state_dicts_close(actual: Mapping[str, Tensor], expected: Mapping[str
         torch.testing.assert_close(actual[key], expected[key], rtol=rtol, atol=atol, msg=lambda msg: f"{key}: {msg}")
 
 
+def assert_state_dicts_equal(actual: Mapping[str, Tensor], expected: Mapping[str, Tensor]) -> None:
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        torch.testing.assert_close(actual[key], expected[key], rtol=0.0, atol=0.0, msg=lambda msg: f"{key}: {msg}")
+
+
 def train_single_process_reference(
     initial_model: nn.Module,
     xs_cpu: Sequence[Tensor],
@@ -229,12 +235,14 @@ def train_single_process_streaming(
     steps: int,
     device: torch.device,
     pin_cpu_masters=True,
+    resident_suffix_count: int = 0,
 ) -> nn.Module:
     model = copy.deepcopy(initial_model)
     engine = apply_cpu_streaming_(
         model,
         module_path,
         offload_policy=offload_policy,
+        resident_suffix_count=resident_suffix_count,
         optimizer_cls=optimizer_cls_for(optimizer_name),
         optimizer_kwargs=optimizer_kwargs,
         max_grad_norm=max_grad_norm,
@@ -334,6 +342,45 @@ def test_one_gpu_cuda_streaming_matches_single_process_reference(pin_cpu_masters
     assert_state_dicts_close(streaming.state_dict(), reference.state_dict(), dtype=dtype)
 
 
+def test_one_gpu_cuda_resident_suffix_matches_single_process_reference() -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        pytest.skip("needs exactly one CUDA device")
+
+    dtype = torch.float32
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+    initial_model = SandwichModel(dtype=dtype)
+    xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
+    optimizer_kwargs = optimizer_kwargs_for("adamw")
+
+    reference = train_single_process_reference(
+        initial_model,
+        xs_cpu,
+        ys_cpu,
+        optimizer_name="adamw",
+        optimizer_kwargs=optimizer_kwargs,
+        max_grad_norm=None,
+        steps=2,
+        device=device,
+    )
+    streaming = train_single_process_streaming(
+        initial_model,
+        "layers",
+        xs_cpu,
+        ys_cpu,
+        offload_policy=True,
+        resident_suffix_count=2,
+        optimizer_name="adamw",
+        optimizer_kwargs=optimizer_kwargs,
+        max_grad_norm=None,
+        steps=2,
+        device=device,
+        pin_cpu_masters="eager",
+    )
+
+    assert_state_dicts_equal(streaming.state_dict(), reference.state_dict())
+
+
 def test_transformation_keeps_modulelist_iteration_api() -> None:
     model = SandwichModel(dtype=torch.float64)
     engine = apply_cpu_streaming_(
@@ -355,6 +402,25 @@ def test_transformation_keeps_modulelist_iteration_api() -> None:
     assert closed is not None
     assert isinstance(closed.layers, nn.ModuleList)
     assert not isinstance(closed.layers, CPUStreamingModuleList)
+
+
+def test_resident_suffix_overrides_offload_policy() -> None:
+    model = SandwichModel(dtype=torch.float64)
+    engine = apply_cpu_streaming_(
+        model,
+        "layers",
+        offload_policy=True,
+        resident_suffix_count=2,
+        optimizer_cls=torch.optim.AdamW,
+        optimizer_kwargs=optimizer_kwargs_for("adamw"),
+        device=torch.device("cpu"),
+        auto_init_process_group=False,
+        wrap_ddp=False,
+    )
+
+    assert isinstance(model.layers, CPUStreamingModuleList)
+    assert [stage.offloaded for stage in model.layers] == [True, False, False]
+    assert [handle.qualified_name for handle in engine.handles] == ["layers.0"]
 
 
 def test_transformation_supports_sequential_call_api() -> None:

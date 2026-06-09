@@ -41,6 +41,7 @@ STREAM_MODULE_PATH = "model.layers"
 QWEN_MODEL_NAME = "Qwen/Qwen2.5-Coder-14B-Instruct"
 SEQUENCE_LENGTHS = [1000, 2000, 4000, 8000]
 VISTA_HOST_SUFFIX = ".vista.tacc.utexas.edu"
+RESIDENT_SUFFIX_COUNT = int(os.environ.get("DTAI_QWEN_RESIDENT_SUFFIX_COUNT", os.environ.get("DTAI_QWEN_RESIDENT_SUFFIX", "0")))
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class QwenMemoryRow:
     model_name: str
     seq_len: int
     num_layers: int
+    resident_suffix_count: int
     parameter_count: int
     offloaded_total_gib: float
     largest_layer_gib: float
@@ -82,14 +84,20 @@ def gib(bytes_value: int | float) -> float:
     return float(bytes_value) / (1024**3)
 
 
-def offloaded_layer_bytes(model: nn.Module) -> Tuple[int, int, int]:
+def offloaded_layer_bytes(model: nn.Module, resident_suffix_count: int = 0) -> Tuple[int, int, int]:
     layers = model.get_submodule(STREAM_MODULE_PATH)
     layer_bytes = [parameter_bytes(layer) for layer in layers]
-    return len(layers), sum(layer_bytes), max(layer_bytes)
+    if resident_suffix_count:
+        layer_bytes = layer_bytes[:-resident_suffix_count]
+    return len(layers), sum(layer_bytes), max(layer_bytes) if layer_bytes else 0
 
 
-def resident_layer_bytes(model: nn.Module) -> int:
-    layer_param_ids = {id(parameter) for parameter in model.get_submodule(STREAM_MODULE_PATH).parameters()}
+def resident_layer_bytes(model: nn.Module, resident_suffix_count: int = 0) -> int:
+    layers = model.get_submodule(STREAM_MODULE_PATH)
+    offloaded_layers = list(layers)
+    if resident_suffix_count:
+        offloaded_layers = offloaded_layers[:-resident_suffix_count]
+    layer_param_ids = {id(parameter) for layer in offloaded_layers for parameter in layer.parameters()}
     return sum(
         parameter.numel() * parameter.element_size()
         for parameter in model.parameters()
@@ -112,6 +120,7 @@ def print_qwen_memory_table(rows: List[QwenMemoryRow]) -> None:
     columns: List[Tuple[str, int, str]] = [
         ("seq len", 8, "right"),
         ("layers", 6, "right"),
+        ("resident tail", 13, "right"),
         ("params (B)", 10, "right"),
         ("offloaded (GiB)", 15, "right"),
         ("largest (GiB)", 13, "right"),
@@ -136,6 +145,7 @@ def print_qwen_memory_table(rows: List[QwenMemoryRow]) -> None:
         values = [
             f"{row.seq_len:d}",
             f"{row.num_layers:d}",
+            f"{row.resident_suffix_count:d}",
             f"{row.parameter_count / 1e9:.3f}",
             f"{row.offloaded_total_gib:.3f}",
             f"{row.largest_layer_gib:.3f}",
@@ -207,14 +217,15 @@ def run_one_gpu_qwen_memory_case(seq_len: int) -> QwenMemoryRow:
         local_files_only=True,
     )
     print(f"loaded {QWEN_MODEL_NAME} for seq_len={seq_len} in {time.perf_counter() - model_load_start:.2f}s", flush=True)
-    num_layers, offloaded_total_bytes, largest_layer_bytes = offloaded_layer_bytes(model)
-    resident_bytes = resident_layer_bytes(model)
+    num_layers, offloaded_total_bytes, largest_layer_bytes = offloaded_layer_bytes(model, RESIDENT_SUFFIX_COUNT)
+    resident_bytes = resident_layer_bytes(model, RESIDENT_SUFFIX_COUNT)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
 
     engine = apply_cpu_streaming_(
         model,
         STREAM_MODULE_PATH,
         offload_policy=True,
+        resident_suffix_count=RESIDENT_SUFFIX_COUNT,
         optimizer_cls=torch.optim.AdamW,
         optimizer_kwargs={"lr": 1e-5, "betas": (0.9, 0.95), "eps": 1e-8, "weight_decay": 0.01, "foreach": False},
         max_grad_norm=1.0,
@@ -270,6 +281,7 @@ def run_one_gpu_qwen_memory_case(seq_len: int) -> QwenMemoryRow:
         model_name=QWEN_MODEL_NAME,
         seq_len=seq_len,
         num_layers=num_layers,
+        resident_suffix_count=RESIDENT_SUFFIX_COUNT,
         parameter_count=parameter_count,
         offloaded_total_gib=gib(offloaded_total_bytes),
         largest_layer_gib=gib(largest_layer_bytes),

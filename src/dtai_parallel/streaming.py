@@ -1759,6 +1759,7 @@ def _build_streaming_container(
     container: nn.Module,
     module_path: str,
     offload_policy: OffloadPolicy,
+    resident_suffix_count: int,
     local_device: torch.device,
     process_group: Optional[Any],
     metrics: StreamingTransferMetrics,
@@ -1775,9 +1776,18 @@ def _build_streaming_container(
         )
 
     world = _world_size(process_group)
+    module_count = len(container)
+    if resident_suffix_count < 0:
+        raise ValueError("resident_suffix_count must be non-negative")
+    if resident_suffix_count > module_count:
+        raise ValueError(
+            f"resident_suffix_count is {resident_suffix_count}, but {module_path!r} contains only {module_count} stages"
+        )
+    first_resident_suffix_index = module_count - resident_suffix_count
+
     stages: "OrderedDict[str, _StreamingStage]" = OrderedDict()
     for index, (name, child) in enumerate(container._modules.items()):
-        offload = _policy_value(offload_policy, index, name, child)
+        offload = _policy_value(offload_policy, index, name, child) and index < first_resident_suffix_index
         qualified_name = f"{module_path}.{name}"
         if offload:
             handle = _OffloadedModuleHandle(
@@ -1819,6 +1829,7 @@ def apply_cpu_streaming_(
     module_path: str,
     *,
     offload_policy: OffloadPolicy = True,
+    resident_suffix_count: int = 0,
     optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.AdamW,
     optimizer_kwargs: Optional[Mapping[str, Any]] = None,
     max_grad_norm: Optional[float] = None,
@@ -1849,6 +1860,11 @@ def apply_cpu_streaming_(
         ``True`` offloads every item in the list.  ``False`` keeps every item
         resident.  A sequence of booleans controls individual stages.  A callable
         receives ``(index, name, module)`` and returns a boolean.
+    resident_suffix_count:
+        Number of trailing items in the target ``ModuleList`` or ``Sequential``
+        to keep resident, regardless of ``offload_policy``.  For example,
+        ``offload_policy=True, resident_suffix_count=2`` offloads all but the
+        final two stages.
     optimizer_cls, optimizer_kwargs:
         A real PyTorch optimizer class and its keyword arguments.  One optimizer
         is constructed for resident parameters.  Offloaded stages construct
@@ -1893,6 +1909,7 @@ def apply_cpu_streaming_(
         container=target,
         module_path=module_path,
         offload_policy=offload_policy,
+        resident_suffix_count=int(resident_suffix_count),
         local_device=local_device,
         process_group=process_group,
         metrics=metrics,
