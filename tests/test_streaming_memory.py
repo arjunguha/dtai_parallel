@@ -424,11 +424,12 @@ def test_streaming_peak_memory_is_bounded_by_layerwise_offload(
     assert transfer_d2h_bytes > 0
 
     # Offloaded AdamW state lives on CPU: weights, accumulated gradients, and
-    # two moments.  CUDA-only gradient math stages one layer at a time, which can
-    # leave one extra layer-sized pinned CPU transfer buffer live around samples.
+    # two moments.  CUDA-only gradient math stages one layer at a time, and
+    # deferred D2H synchronization can leave up to three layer-sized pinned CPU
+    # transfer buffers live around samples.
     assert cpu_peak >= int(0.85 * expected_cpu_peak)
     if layer_param_scale == 1.0:
-        assert cpu_peak <= int(1.35 * expected_cpu_peak + largest_layer_bytes)
+        assert cpu_peak <= int(1.35 * expected_cpu_peak + 3 * largest_layer_bytes)
     else:
         full_cpu_peak_gib = MEASURED_CPU_PEAK_GIB[(num_layers, 1.0)]
         assert measured_cpu_peak_gib < full_cpu_peak_gib

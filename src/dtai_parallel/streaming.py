@@ -719,6 +719,7 @@ class _OffloadedModuleHandle:
         self._prefetched: Optional[_PrefetchedState] = None
         self._prefetch_streams: Dict[Tuple[int, bool], torch.cuda.Stream] = {}
         self._pending_grad_copies: Dict[str, List[_PendingGradCopy]] = {}
+        self._grad_copy_events: Dict[str, torch.cuda.Event] = {}
 
     @property
     def parameters_by_name(self) -> "OrderedDict[str, nn.Parameter]":
@@ -732,6 +733,7 @@ class _OffloadedModuleHandle:
         self.module.train(mode)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        self._wait_all_grad_copies()
         self._discard_pending_grad_copies()
         for parameter in self.parameters_by_name.values():
             if set_to_none:
@@ -740,6 +742,24 @@ class _OffloadedModuleHandle:
                 parameter.grad = torch.zeros_like(parameter, memory_format=torch.preserve_format)
             else:
                 parameter.grad.zero_()
+
+    def _record_grad_copy(self, name: str, device: torch.device) -> None:
+        if device.type != "cuda":
+            return
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device))
+        self._grad_copy_events[name] = event
+
+    def _wait_grad_copy(self, name: str) -> None:
+        event = self._grad_copy_events.pop(name, None)
+        if event is not None:
+            event.synchronize()
+
+    def _wait_all_grad_copies(self) -> None:
+        events = list(self._grad_copy_events.values())
+        self._grad_copy_events = {}
+        for event in events:
+            event.synchronize()
 
     def broadcast_initial_state(self) -> None:
         """Make hidden CPU masters identical across ranks after random init."""
@@ -845,6 +865,7 @@ class _OffloadedModuleHandle:
                     if target.grad is None:
                         accumulated = grad_detached
                     else:
+                        self._wait_grad_copy(name)
                         accumulated = _copy_tensor_to_device(
                             target.grad.detach(),
                             grad_detached.device,
@@ -853,7 +874,7 @@ class _OffloadedModuleHandle:
                         )
                         accumulated.add_(grad_detached)
                     target.grad = _copy_tensor_to_cpu(accumulated, metrics=self.metrics, kind="grad_d2h", like=target)
-                    torch.cuda.current_stream(grad_detached.device).synchronize()
+                    self._record_grad_copy(name, grad_detached.device)
                 elif target.grad is None:
                     target.grad = grad.detach().clone()
                 else:
@@ -890,9 +911,10 @@ class _OffloadedModuleHandle:
 
         if self.local_device.type == "cuda":
             if _distributed_is_active(self.process_group):
-                for parameter in self.parameters_by_name.values():
+                for name, parameter in self.parameters_by_name.items():
                     if parameter.grad is None:
                         continue
+                    self._wait_grad_copy(name)
                     staged_grad = _copy_tensor_to_device(
                         parameter.grad.detach(),
                         self.local_device,
@@ -901,7 +923,7 @@ class _OffloadedModuleHandle:
                     )
                     reduced = _all_reduce_mean_(staged_grad, self.local_device, self.process_group).detach()
                     parameter.grad = _copy_tensor_to_cpu(reduced, metrics=self.metrics, kind="grad_reduce_d2h", like=parameter)
-                    torch.cuda.current_stream(self.local_device).synchronize()
+                    self._record_grad_copy(name, self.local_device)
             return
 
         self.flush_pending_gradients()
@@ -916,9 +938,10 @@ class _OffloadedModuleHandle:
         if device.type != "cuda":
             return _grad_total_norm((parameter.grad for parameter in self.parameters_by_name.values()), norm_type=norm_type, device=device)
         staged_grads: List[Tensor] = []
-        for parameter in self.parameters_by_name.values():
+        for name, parameter in self.parameters_by_name.items():
             if parameter.grad is None:
                 continue
+            self._wait_grad_copy(name)
             staged_grads.append(
                 _copy_tensor_to_device(
                     parameter.grad.detach(),
@@ -973,6 +996,7 @@ class _OffloadedModuleHandle:
                     requires_grad=cpu_parameter.requires_grad,
                 )
                 if cpu_parameter.grad is not None:
+                    self._wait_grad_copy(name)
                     staged.grad = _copy_tensor_to_device(
                         cpu_parameter.grad.detach(),
                         optimizer_device,
@@ -1010,7 +1034,8 @@ class _OffloadedModuleHandle:
             del optimizer, staged_parameters
             self.evict_device(optimizer_device)
 
-        for _, cpu_parameter in named_parameters:
+        for name, cpu_parameter in named_parameters:
+            self._wait_grad_copy(name)
             _broadcast_tensor_(cpu_parameter.data, src=owner, local_device=self.local_device, process_group=self.process_group)
             cpu_parameter.grad = None
 
