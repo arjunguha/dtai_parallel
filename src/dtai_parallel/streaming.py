@@ -376,7 +376,7 @@ def _all_reduce_mean_(tensor: Tensor, local_device: torch.device, process_group:
     dist.all_reduce(work, op=dist.ReduceOp.SUM, group=process_group)
     work.div_(float(dist.get_world_size(process_group)))
     if work.device != original_device:
-        work = work.to(original_device, non_blocking=True)
+        work = work.to(original_device, non_blocking=original_device.type != "cpu")
     return work
 
 
@@ -389,7 +389,7 @@ def _broadcast_tensor_(tensor: Tensor, src: int, local_device: torch.device, pro
     work = tensor.detach().to(comm_device, non_blocking=True).clone()
     dist.broadcast(work, src=src, group=process_group)
     if work.device != tensor.device:
-        work = work.to(tensor.device, non_blocking=True)
+        work = work.to(tensor.device, non_blocking=tensor.device.type != "cpu")
     tensor.data.copy_(work)
 
 

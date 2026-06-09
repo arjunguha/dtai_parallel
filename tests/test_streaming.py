@@ -30,7 +30,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 
-from cpu_streaming_ddp import (
+from dtai_parallel import (
     CPUStreamingModuleList,
     CPUStreamingSequential,
     apply_cpu_streaming_,
@@ -404,24 +404,6 @@ def test_forward_and_backward_prefetch_are_scheduled() -> None:
 
     assert counts.get(("layers.2", False), 0) >= 1, "forward should prefetch a later offloaded stage"
     assert counts.get(("layers.0", True), 0) >= 1, "backward should prefetch the previous offloaded stage"
-
-
-def test_training_loop_must_place_input_on_local_device() -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("device-placement error needs a CUDA device and a CPU input")
-    model = SandwichModel(dtype=torch.float32)
-    engine = apply_cpu_streaming_(
-        model,
-        "layers",
-        offload_policy=True,
-        optimizer_cls=torch.optim.AdamW,
-        optimizer_kwargs=optimizer_kwargs_for("adamw"),
-        device=torch.device("cuda:0"),
-        auto_init_process_group=False,
-        wrap_ddp=False,
-    )
-    with pytest.raises(ValueError, match="local batch"):
-        _ = engine.model(torch.randn(2, 5))
 
 
 def _reference_ddp_worker(

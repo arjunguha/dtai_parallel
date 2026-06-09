@@ -1,9 +1,19 @@
 from .streaming import (
-    CPUStreamingDataParallel,
-    StageSpec,
+    CPUStreamingEngine,
+    CPUStreamingModuleList,
+    CPUStreamingSequential,
+    StreamingConfig,
+    apply_cpu_streaming,
+    apply_cpu_streaming_,
+    apply_cpu_streaming_to_modulelist_,
 )
 
 __all__ = [
-    "CPUStreamingDataParallel",
-    "StageSpec",
+    "CPUStreamingEngine",
+    "CPUStreamingModuleList",
+    "CPUStreamingSequential",
+    "StreamingConfig",
+    "apply_cpu_streaming",
+    "apply_cpu_streaming_",
+    "apply_cpu_streaming_to_modulelist_",
 ]
