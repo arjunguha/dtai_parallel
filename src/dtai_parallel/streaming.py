@@ -309,6 +309,24 @@ def _clip_coef(total_norm: Tensor, *, max_norm: float, error_if_nonfinite: bool)
     return torch.clamp(torch.as_tensor(float(max_norm), device=total_norm.device) / (total_norm + 1e-6), max=1.0)
 
 
+def _optimizer_updates_are_parameterwise(optimizer_cls: Type[torch.optim.Optimizer]) -> bool:
+    return optimizer_cls in {torch.optim.AdamW, torch.optim.Adam, torch.optim.SGD}
+
+
+def _parameter_groups_by_prefix(named_parameters: Sequence[Tuple[str, nn.Parameter]]) -> List[List[Tuple[str, nn.Parameter]]]:
+    groups: List[List[Tuple[str, nn.Parameter]]] = []
+    group_by_prefix: Dict[str, List[Tuple[str, nn.Parameter]]] = {}
+    for name, parameter in named_parameters:
+        prefix = name.split(".", 1)[0]
+        group = group_by_prefix.get(prefix)
+        if group is None:
+            group = []
+            group_by_prefix[prefix] = group
+            groups.append(group)
+        group.append((name, parameter))
+    return groups
+
+
 class _RNGSnapshot:
     """Save enough RNG state to replay a stochastic layer during backward.
 
@@ -552,14 +570,22 @@ def _collective_tensor_device(tensor: Tensor, local_device: torch.device, proces
     return torch.device("cpu")
 
 
-def _all_reduce_mean_(tensor: Tensor, local_device: torch.device, process_group: Optional[Any]) -> Tensor:
+def _all_reduce_mean_(
+    tensor: Tensor,
+    local_device: torch.device,
+    process_group: Optional[Any],
+    *,
+    clone: bool = True,
+) -> Tensor:
     """All-reduce ``tensor`` and return an averaged tensor on the original device."""
 
     if not _distributed_is_active(process_group):
         return tensor
     original_device = tensor.device
     comm_device = _collective_tensor_device(tensor, local_device, process_group)
-    work = tensor.detach().to(comm_device, non_blocking=True).clone()
+    work = tensor.detach().to(comm_device, non_blocking=True)
+    if clone:
+        work = work.clone()
     dist.all_reduce(work, op=dist.ReduceOp.SUM, group=process_group)
     work.div_(float(dist.get_world_size(process_group)))
     if work.device != original_device:
@@ -716,8 +742,10 @@ class _OffloadedModuleHandle:
         self.module = copy.deepcopy(module).cpu()
         if self.local_device.type == "cuda":
             _pin_module_cpu_tensors_if_possible_(self.module)
-        self.param_names = [name for name, _ in self.module.named_parameters(recurse=True)]
-        self.buffer_names = [name for name, _ in self.module.named_buffers(recurse=True)]
+        self._parameters_by_name: "OrderedDict[str, nn.Parameter]" = OrderedDict(self.module.named_parameters(recurse=True))
+        self._buffers_by_name: "OrderedDict[str, Tensor]" = OrderedDict(self.module.named_buffers(recurse=True))
+        self.param_names = list(self._parameters_by_name)
+        self.buffer_names = list(self._buffers_by_name)
         self.optimizer_state: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._prefetched: Optional[_PrefetchedState] = None
@@ -728,11 +756,11 @@ class _OffloadedModuleHandle:
 
     @property
     def parameters_by_name(self) -> "OrderedDict[str, nn.Parameter]":
-        return OrderedDict(self.module.named_parameters(recurse=True))
+        return self._parameters_by_name
 
     @property
     def buffers_by_name(self) -> "OrderedDict[str, Tensor]":
-        return OrderedDict(self.module.named_buffers(recurse=True))
+        return self._buffers_by_name
 
     def train(self, mode: bool = True) -> None:
         self.module.train(mode)
@@ -888,7 +916,8 @@ class _OffloadedModuleHandle:
                             kind="grad_accum_h2d",
                         )
                         accumulated.add_(grad_detached)
-                    self._record_grad_norm(name, accumulated, norm_type=self.grad_norm_type)
+                    if not _distributed_is_active(self.process_group):
+                        self._record_grad_norm(name, accumulated, norm_type=self.grad_norm_type)
                     target.grad = _copy_tensor_to_cpu(accumulated, metrics=self.metrics, kind="grad_d2h", like=target)
                     self._record_grad_copy(name, grad_detached.device)
                 elif target.grad is None:
@@ -937,7 +966,7 @@ class _OffloadedModuleHandle:
                         metrics=self.metrics,
                         kind="grad_reduce_h2d",
                     )
-                    reduced = _all_reduce_mean_(staged_grad, self.local_device, self.process_group).detach()
+                    reduced = _all_reduce_mean_(staged_grad, self.local_device, self.process_group, clone=False).detach()
                     self._record_grad_norm(name, reduced, norm_type=self.grad_norm_type)
                     parameter.grad = _copy_tensor_to_cpu(reduced, metrics=self.metrics, kind="grad_reduce_d2h", like=parameter)
                     self._record_grad_copy(name, self.local_device)
@@ -1012,54 +1041,61 @@ class _OffloadedModuleHandle:
         rank = _rank(self.process_group)
         owner = self.owner_rank
         if rank == owner:
-            staged_parameters: List[nn.Parameter] = []
-            for name, cpu_parameter in named_parameters:
-                staged = nn.Parameter(
-                    _copy_tensor_to_device(
-                        cpu_parameter.detach(),
-                        optimizer_device,
-                        metrics=self.metrics,
-                        kind="optimizer_param_h2d",
-                    ),
-                    requires_grad=cpu_parameter.requires_grad,
-                )
-                if cpu_parameter.grad is not None:
-                    self._wait_grad_copy(name)
-                    staged.grad = _copy_tensor_to_device(
-                        cpu_parameter.grad.detach(),
-                        optimizer_device,
-                        metrics=self.metrics,
-                        kind="optimizer_grad_h2d",
+            optimizer_clip_coef = clip_coef.to(optimizer_device) if clip_coef is not None else None
+            optimizer_groups = (
+                _parameter_groups_by_prefix(named_parameters)
+                if _optimizer_updates_are_parameterwise(optimizer_cls)
+                else [named_parameters]
+            )
+            for named_parameter_group in optimizer_groups:
+                staged_parameters: List[nn.Parameter] = []
+                for name, cpu_parameter in named_parameter_group:
+                    staged = nn.Parameter(
+                        _copy_tensor_to_device(
+                            cpu_parameter.detach(),
+                            optimizer_device,
+                            metrics=self.metrics,
+                            kind="optimizer_param_h2d",
+                        ),
+                        requires_grad=cpu_parameter.requires_grad,
                     )
-                    if clip_coef is not None:
-                        staged.grad.mul_(clip_coef.to(staged.grad.device))
-                staged_parameters.append(staged)
+                    if cpu_parameter.grad is not None:
+                        self._wait_grad_copy(name)
+                        staged.grad = _copy_tensor_to_device(
+                            cpu_parameter.grad.detach(),
+                            optimizer_device,
+                            metrics=self.metrics,
+                            kind="optimizer_grad_h2d",
+                        )
+                        if optimizer_clip_coef is not None:
+                            staged.grad.mul_(optimizer_clip_coef)
+                    staged_parameters.append(staged)
 
-            optimizer = optimizer_cls(staged_parameters, **dict(optimizer_kwargs))
-            for (name, _), staged in zip(named_parameters, staged_parameters):
-                saved_state = self.optimizer_state.get(name)
-                if saved_state is not None:
-                    optimizer.state[staged] = _Tree.to_device(saved_state, optimizer_device, metrics=self.metrics)
+                optimizer = optimizer_cls(staged_parameters, **dict(optimizer_kwargs))
+                for (name, _), staged in zip(named_parameter_group, staged_parameters):
+                    saved_state = self.optimizer_state.get(name)
+                    if saved_state is not None:
+                        optimizer.state[staged] = _Tree.to_device(saved_state, optimizer_device, metrics=self.metrics)
 
-            optimizer.step()
+                optimizer.step()
 
-            for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
-                staged_detached = staged.detach()
-                self.metrics.record_copy(
-                    "optimizer_param_d2h",
-                    _tensor_nbytes(staged_detached),
-                    optimizer_device,
-                    lambda staged_detached=staged_detached, cpu_parameter=cpu_parameter: cpu_parameter.data.copy_(
-                        staged_detached, non_blocking=True
-                    ),
-                )
-                if staged in optimizer.state:
-                    self.optimizer_state[name] = _Tree.detach_cpu(optimizer.state[staged], metrics=self.metrics)
+                for (name, cpu_parameter), staged in zip(named_parameter_group, staged_parameters):
+                    staged_detached = staged.detach()
+                    self.metrics.record_copy(
+                        "optimizer_param_d2h",
+                        _tensor_nbytes(staged_detached),
+                        optimizer_device,
+                        lambda staged_detached=staged_detached, cpu_parameter=cpu_parameter: cpu_parameter.data.copy_(
+                            staged_detached, non_blocking=True
+                        ),
+                    )
+                    if staged in optimizer.state:
+                        self.optimizer_state[name] = _Tree.detach_cpu(optimizer.state[staged], metrics=self.metrics)
 
-            if optimizer_device.type == "cuda":
-                torch.cuda.current_stream(optimizer_device).synchronize()
+                if optimizer_device.type == "cuda":
+                    torch.cuda.current_stream(optimizer_device).synchronize()
 
-            del optimizer, staged_parameters
+                del optimizer, staged_parameters
             self.evict_device(optimizer_device)
 
         for name, cpu_parameter in named_parameters:
@@ -1500,10 +1536,11 @@ class CPUStreamingEngine:
     def _scale_resident_cuda_gradients_(self, clip_coef: Tensor) -> None:
         if self.resident_optimizer is None:
             return
+        resident_clip_coef = clip_coef.to(self.local_device)
         for group in self.resident_optimizer.param_groups:
             for parameter in group["params"]:
                 if parameter.grad is not None:
-                    parameter.grad.mul_(clip_coef.to(parameter.grad.device))
+                    parameter.grad.mul_(resident_clip_coef)
 
     def step(self) -> Optional[Tensor]:
         """Synchronize offloaded gradients, optionally clip, and run optimizers."""
