@@ -4,7 +4,8 @@ Uses the same measurement principles as ``test_streaming_memory.py``: CPU RSS fr
 ``/proc/self/status`` and CUDA peak from ``torch.cuda.max_memory_allocated()``.
 
 Sequence length is varied across 1k, 2k, 4k, and 8k tokens to show how activation
-memory affects the CUDA peak while CPU offload footprint stays fixed.
+memory affects the CUDA peak while CPU offload footprint stays fixed.  Step time is
+averaged over all training steps except the first warmup step.
 
 Run with verbose output to see the cross-sequence-length comparison table::
 
@@ -19,6 +20,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -42,7 +44,7 @@ from transformers import AutoModelForCausalLM
 from dtai_parallel import apply_cpu_streaming_
 
 BATCH_SIZE = 1
-TRAIN_STEPS = 2
+TRAIN_STEPS = 4
 STREAM_MODULE_PATH = "model.layers"
 SEQUENCE_LENGTHS = [1000, 2000, 4000, 8000]
 QWEN_MODEL_DIRNAMES = (
@@ -62,6 +64,7 @@ class QwenMemoryRow:
     resident_gib: float
     measured_cpu_peak_gib: float
     measured_cuda_peak_gib: float
+    avg_step_seconds: float
 
     @property
     def sort_key(self) -> int:
@@ -130,13 +133,9 @@ def print_qwen_memory_table(rows: List[QwenMemoryRow]) -> None:
 
     columns: List[Tuple[str, int, str]] = [
         ("seq len", 8, "right"),
-        ("layers", 6, "right"),
-        ("params (B)", 10, "right"),
-        ("offloaded (GiB)", 15, "right"),
-        ("largest (GiB)", 13, "right"),
-        ("resident (GiB)", 14, "right"),
-        ("CPU RSS (GiB)", 15, "right"),
         ("CUDA peak (GiB)", 16, "right"),
+        ("CPU RSS (GiB)", 15, "right"),
+        ("avg step (s)", 12, "right"),
     ]
 
     ordered = sorted(rows, key=lambda row: row.sort_key)
@@ -150,13 +149,9 @@ def print_qwen_memory_table(rows: List[QwenMemoryRow]) -> None:
     for row in ordered:
         values = [
             f"{row.seq_len:d}",
-            f"{row.num_layers:d}",
-            f"{row.parameter_count / 1e9:.3f}",
-            f"{row.offloaded_total_gib:.3f}",
-            f"{row.largest_layer_gib:.3f}",
-            f"{row.resident_gib:.3f}",
-            f"{row.measured_cpu_peak_gib:.3f}",
             f"{row.measured_cuda_peak_gib:.3f}",
+            f"{row.measured_cpu_peak_gib:.3f}",
+            f"{row.avg_step_seconds:.3f}",
         ]
         print(
             "  ".join(
@@ -231,10 +226,12 @@ def _qwen_memory_worker(
         assert isinstance(engine.model, DDP)
 
         vocab_size = model.config.vocab_size
-        iteration_records: List[Dict[str, int]] = []
+        iteration_records: List[Dict[str, float]] = []
+        step_seconds: List[float] = []
         tracker = IterationMemoryTracker(device)
 
         for _ in range(TRAIN_STEPS):
+            step_start = time.perf_counter()
             tracker.begin_iteration()
             engine.zero_grad(set_to_none=True)
             tracker.sample()
@@ -249,10 +246,15 @@ def _qwen_memory_worker(
             engine.step()
             tracker.sample()
 
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+            step_seconds.append(time.perf_counter() - step_start)
             iteration_records.append(
                 {
                     "cpu_rss_peak_bytes": tracker.cpu_rss_peak,
                     "cuda_peak_bytes": tracker.cuda_peak,
+                    "step_seconds": step_seconds[-1],
                 }
             )
 
@@ -267,6 +269,7 @@ def _qwen_memory_worker(
                 "largest_layer_bytes": largest_layer_bytes,
                 "resident_bytes": resident_bytes,
                 "iteration_records": iteration_records,
+                "step_seconds": step_seconds,
             }
             with open(result_file, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2)
@@ -336,6 +339,9 @@ def test_qwen14b_streaming_peak_memory(
 
     cpu_peak = max(int(record["cpu_rss_peak_bytes"]) for record in records)
     cuda_peak = max(int(record["cuda_peak_bytes"]) for record in records)
+    step_seconds = [float(value) for value in payload["step_seconds"]]
+    assert len(step_seconds) == TRAIN_STEPS
+    avg_step_seconds = sum(step_seconds[1:]) / len(step_seconds[1:])
 
     qwen_memory_rows.append(
         QwenMemoryRow(
@@ -348,8 +354,10 @@ def test_qwen14b_streaming_peak_memory(
             resident_gib=gib(resident_bytes),
             measured_cpu_peak_gib=gib(cpu_peak),
             measured_cuda_peak_gib=gib(cuda_peak),
+            avg_step_seconds=avg_step_seconds,
         )
     )
 
     assert cpu_peak > 0
     assert cuda_peak > 0
+    assert avg_step_seconds > 0
