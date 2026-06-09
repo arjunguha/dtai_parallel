@@ -64,6 +64,7 @@ except Exception:  # pragma: no cover
 
 DeviceLike = Union[str, torch.device]
 OffloadPolicy = Union[bool, Sequence[bool], Callable[[int, str, nn.Module], bool]]
+PinCpuMasters = Union[bool, str]
 _SENTINEL = "__cpu_streaming_ddp_tensor_leaf__"
 
 
@@ -180,15 +181,54 @@ class _Tree:
         *,
         metrics: Optional[StreamingTransferMetrics] = None,
         kind: str = "optimizer_state_h2d",
+        pin_source: bool = False,
+        pinned_transfer_buffer: Optional["_PinnedTransferBuffer"] = None,
     ) -> Any:
         if torch.is_tensor(value):
-            return _copy_tensor_to_device(value.detach(), device, metrics=metrics, kind=kind)
+            return _copy_tensor_to_device(
+                value.detach(),
+                device,
+                metrics=metrics,
+                kind=kind,
+                pin_source=pin_source,
+                pinned_transfer_buffer=pinned_transfer_buffer,
+            )
         if isinstance(value, dict):
-            return {k: _Tree.to_device(v, device, metrics=metrics, kind=kind) for k, v in value.items()}
+            return {
+                k: _Tree.to_device(
+                    v,
+                    device,
+                    metrics=metrics,
+                    kind=kind,
+                    pin_source=pin_source,
+                    pinned_transfer_buffer=pinned_transfer_buffer,
+                )
+                for k, v in value.items()
+            }
         if isinstance(value, list):
-            return [_Tree.to_device(v, device, metrics=metrics, kind=kind) for v in value]
+            return [
+                _Tree.to_device(
+                    v,
+                    device,
+                    metrics=metrics,
+                    kind=kind,
+                    pin_source=pin_source,
+                    pinned_transfer_buffer=pinned_transfer_buffer,
+                )
+                for v in value
+            ]
         if isinstance(value, tuple):
-            return tuple(_Tree.to_device(v, device, metrics=metrics, kind=kind) for v in value)
+            return tuple(
+                _Tree.to_device(
+                    v,
+                    device,
+                    metrics=metrics,
+                    kind=kind,
+                    pin_source=pin_source,
+                    pinned_transfer_buffer=pinned_transfer_buffer,
+                )
+                for v in value
+            )
         return copy.deepcopy(value)
 
     @staticmethod
@@ -197,15 +237,16 @@ class _Tree:
         *,
         metrics: Optional[StreamingTransferMetrics] = None,
         kind: str = "optimizer_state_d2h",
+        pin_memory: bool = True,
     ) -> Any:
         if torch.is_tensor(value):
-            return _copy_tensor_to_cpu(value.detach(), metrics=metrics, kind=kind)
+            return _copy_tensor_to_cpu(value.detach(), metrics=metrics, kind=kind, pin_memory=pin_memory)
         if isinstance(value, dict):
-            return {k: _Tree.detach_cpu(v, metrics=metrics, kind=kind) for k, v in value.items()}
+            return {k: _Tree.detach_cpu(v, metrics=metrics, kind=kind, pin_memory=pin_memory) for k, v in value.items()}
         if isinstance(value, list):
-            return [_Tree.detach_cpu(v, metrics=metrics, kind=kind) for v in value]
+            return [_Tree.detach_cpu(v, metrics=metrics, kind=kind, pin_memory=pin_memory) for v in value]
         if isinstance(value, tuple):
-            return tuple(_Tree.detach_cpu(v, metrics=metrics, kind=kind) for v in value)
+            return tuple(_Tree.detach_cpu(v, metrics=metrics, kind=kind, pin_memory=pin_memory) for v in value)
         return copy.deepcopy(value)
 
 
@@ -229,17 +270,69 @@ def _pin_module_cpu_tensors_if_possible_(module: nn.Module) -> None:
         buffer.data = _pin_tensor_if_possible(buffer.detach())
 
 
+def _normalize_pin_cpu_masters(value: PinCpuMasters) -> Tuple[bool, bool]:
+    if isinstance(value, bool):
+        return value, False
+    mode = value.lower()
+    if mode in {"eager", "true", "1", "yes", "on"}:
+        return True, False
+    if mode == "lazy":
+        return False, True
+    if mode in {"false", "0", "no", "off", "none"}:
+        return False, False
+    raise ValueError("pin_cpu_masters must be True, False, 'eager', or 'lazy'")
+
+
+class _PinnedTransferBuffer:
+    """Reusable pinned CPU staging buffers for pageable-CPU to CUDA copies."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buffers: Dict[torch.dtype, Tensor] = {}
+        self._events: Dict[torch.dtype, torch.cuda.Event] = {}
+
+    def copy_to_device(self, tensor: Tensor, device: torch.device) -> Tensor:
+        if tensor.device.type != "cpu" or device.type != "cuda":
+            return tensor.to(device=device, non_blocking=True, copy=True)
+
+        flat = tensor.detach().reshape(-1)
+        dtype = flat.dtype
+        with self._lock:
+            event = self._events.pop(dtype, None)
+            if event is not None:
+                event.synchronize()
+
+            buffer = self._buffers.get(dtype)
+            if buffer is None or buffer.numel() < flat.numel():
+                buffer = torch.empty(flat.numel(), dtype=dtype, device=torch.device("cpu"), pin_memory=True)
+                self._buffers[dtype] = buffer
+
+            staged = buffer[: flat.numel()]
+            staged.copy_(flat)
+            result = staged.view(tensor.shape).to(device=device, non_blocking=True, copy=True)
+
+            done = torch.cuda.Event()
+            done.record(torch.cuda.current_stream(device))
+            self._events[dtype] = done
+            return result
+
+
 def _copy_tensor_to_device(
     tensor: Tensor,
     device: torch.device,
     *,
     metrics: Optional[StreamingTransferMetrics],
     kind: str,
+    pin_source: bool = False,
+    pinned_transfer_buffer: Optional[_PinnedTransferBuffer] = None,
 ) -> Tensor:
     byte_count = _tensor_nbytes(tensor)
+    source = _pin_tensor_if_possible(tensor) if pin_source and pinned_transfer_buffer is None and tensor.device.type == "cpu" else tensor
 
     def copy_fn() -> Tensor:
-        return tensor.to(device=device, non_blocking=True, copy=True)
+        if pinned_transfer_buffer is not None and tensor.device.type == "cpu" and device.type == "cuda":
+            return pinned_transfer_buffer.copy_to_device(tensor, device)
+        return source.to(device=device, non_blocking=True, copy=True)
 
     if metrics is None:
         return copy_fn()
@@ -259,12 +352,17 @@ def _copy_tensor_to_cpu(
     metrics: Optional[StreamingTransferMetrics],
     kind: str,
     like: Optional[Tensor] = None,
+    pin_memory: Optional[bool] = None,
 ) -> Tensor:
     if tensor.device.type == "cpu":
         return tensor.detach().clone()
 
-    pin_memory = bool(tensor.device.type == "cuda" and (like is None or (like.device.type == "cpu" and like.is_pinned())))
-    out = _empty_cpu_like(tensor, pin_memory=pin_memory)
+    should_pin = (
+        bool(tensor.device.type == "cuda" and (like is None or (like.device.type == "cpu" and like.is_pinned())))
+        if pin_memory is None
+        else bool(pin_memory)
+    )
+    out = _empty_cpu_like(tensor, pin_memory=should_pin)
     byte_count = _tensor_nbytes(tensor)
 
     def copy_fn() -> Tensor:
@@ -704,6 +802,9 @@ class _OffloadedModuleHandle:
         metrics: StreamingTransferMetrics,
         grad_norm_type: float,
         track_grad_norms: bool,
+        eager_pin_cpu_masters: bool,
+        lazy_pin_cpu_transfers: bool,
+        pinned_transfer_buffer: Optional[_PinnedTransferBuffer],
     ) -> None:
         self.qualified_name = qualified_name
         self.stage_index = int(stage_index)
@@ -713,8 +814,14 @@ class _OffloadedModuleHandle:
         self.metrics = metrics
         self.grad_norm_type = float(grad_norm_type)
         self.track_grad_norms = bool(track_grad_norms)
-        self.module = copy.deepcopy(module).cpu()
-        if self.local_device.type == "cuda":
+        self.lazy_pin_cpu_transfers = bool(lazy_pin_cpu_transfers)
+        self.pinned_transfer_buffer = pinned_transfer_buffer
+        # The transformation replaces the original container in-place, so the
+        # hidden handle can take ownership of the original child module.  A
+        # deepcopy here briefly duplicates large offloaded layers before pinning,
+        # which can push Qwen-sized models over host memory limits.
+        self.module = module.cpu()
+        if eager_pin_cpu_masters and self.local_device.type == "cuda":
             _pin_module_cpu_tensors_if_possible_(self.module)
         self.param_names = [name for name, _ in self.module.named_parameters(recurse=True)]
         self.buffer_names = [name for name, _ in self.module.named_buffers(recurse=True)]
@@ -787,12 +894,26 @@ class _OffloadedModuleHandle:
     def _state_for_call(self, device: torch.device, requires_grad: bool) -> "OrderedDict[str, Tensor]":
         state: "OrderedDict[str, Tensor]" = OrderedDict()
         for name, parameter in self.parameters_by_name.items():
-            streamed = _copy_tensor_to_device(parameter.detach(), device, metrics=self.metrics, kind="state_h2d")
+            streamed = _copy_tensor_to_device(
+                parameter.detach(),
+                device,
+                metrics=self.metrics,
+                kind="state_h2d",
+                pin_source=self.lazy_pin_cpu_transfers,
+                pinned_transfer_buffer=self.pinned_transfer_buffer,
+            )
             if requires_grad and parameter.requires_grad:
                 streamed.requires_grad_(True)
             state[name] = streamed
         for name, buffer in self.buffers_by_name.items():
-            state[name] = _copy_tensor_to_device(buffer.detach(), device, metrics=self.metrics, kind="state_h2d")
+            state[name] = _copy_tensor_to_device(
+                buffer.detach(),
+                device,
+                metrics=self.metrics,
+                kind="state_h2d",
+                pin_source=self.lazy_pin_cpu_transfers,
+                pinned_transfer_buffer=self.pinned_transfer_buffer,
+            )
         return state
 
     def _prefetch_stream(self, device: torch.device, requires_grad: bool) -> torch.cuda.Stream:
@@ -886,6 +1007,8 @@ class _OffloadedModuleHandle:
                             grad_detached.device,
                             metrics=self.metrics,
                             kind="grad_accum_h2d",
+                            pin_source=self.lazy_pin_cpu_transfers,
+                            pinned_transfer_buffer=self.pinned_transfer_buffer,
                         )
                         accumulated.add_(grad_detached)
                     self._record_grad_norm(name, accumulated, norm_type=self.grad_norm_type)
@@ -936,6 +1059,8 @@ class _OffloadedModuleHandle:
                         self.local_device,
                         metrics=self.metrics,
                         kind="grad_reduce_h2d",
+                        pin_source=self.lazy_pin_cpu_transfers,
+                        pinned_transfer_buffer=self.pinned_transfer_buffer,
                     )
                     reduced = _all_reduce_mean_(staged_grad, self.local_device, self.process_group).detach()
                     self._record_grad_norm(name, reduced, norm_type=self.grad_norm_type)
@@ -976,6 +1101,8 @@ class _OffloadedModuleHandle:
                     device,
                     metrics=self.metrics,
                     kind="grad_norm_h2d",
+                    pin_source=self.lazy_pin_cpu_transfers,
+                    pinned_transfer_buffer=self.pinned_transfer_buffer,
                 )
             )
         return _grad_total_norm(staged_grads, norm_type=norm_type, device=device)
@@ -1020,6 +1147,8 @@ class _OffloadedModuleHandle:
                         optimizer_device,
                         metrics=self.metrics,
                         kind="optimizer_param_h2d",
+                        pin_source=self.lazy_pin_cpu_transfers,
+                        pinned_transfer_buffer=self.pinned_transfer_buffer,
                     ),
                     requires_grad=cpu_parameter.requires_grad,
                 )
@@ -1030,6 +1159,8 @@ class _OffloadedModuleHandle:
                         optimizer_device,
                         metrics=self.metrics,
                         kind="optimizer_grad_h2d",
+                        pin_source=self.lazy_pin_cpu_transfers,
+                        pinned_transfer_buffer=self.pinned_transfer_buffer,
                     )
                     if clip_coef is not None:
                         staged.grad.mul_(clip_coef.to(staged.grad.device))
@@ -1039,7 +1170,13 @@ class _OffloadedModuleHandle:
             for (name, _), staged in zip(named_parameters, staged_parameters):
                 saved_state = self.optimizer_state.get(name)
                 if saved_state is not None:
-                    optimizer.state[staged] = _Tree.to_device(saved_state, optimizer_device, metrics=self.metrics)
+                    optimizer.state[staged] = _Tree.to_device(
+                        saved_state,
+                        optimizer_device,
+                        metrics=self.metrics,
+                        pin_source=self.lazy_pin_cpu_transfers,
+                        pinned_transfer_buffer=self.pinned_transfer_buffer,
+                    )
 
             optimizer.step()
 
@@ -1054,7 +1191,11 @@ class _OffloadedModuleHandle:
                     ),
                 )
                 if staged in optimizer.state:
-                    self.optimizer_state[name] = _Tree.detach_cpu(optimizer.state[staged], metrics=self.metrics)
+                    self.optimizer_state[name] = _Tree.detach_cpu(
+                        optimizer.state[staged],
+                        metrics=self.metrics,
+                        pin_memory=False,
+                    )
 
             if optimizer_device.type == "cuda":
                 torch.cuda.current_stream(optimizer_device).synchronize()
@@ -1623,6 +1764,9 @@ def _build_streaming_container(
     metrics: StreamingTransferMetrics,
     grad_norm_type: float,
     track_grad_norms: bool,
+    eager_pin_cpu_masters: bool,
+    lazy_pin_cpu_transfers: bool,
+    pinned_transfer_buffer: Optional[_PinnedTransferBuffer],
 ) -> Union[CPUStreamingModuleList, CPUStreamingSequential]:
     if not isinstance(container, (nn.ModuleList, nn.Sequential)):
         raise TypeError(
@@ -1646,6 +1790,9 @@ def _build_streaming_container(
                 metrics=metrics,
                 grad_norm_type=grad_norm_type,
                 track_grad_norms=track_grad_norms,
+                eager_pin_cpu_masters=eager_pin_cpu_masters,
+                lazy_pin_cpu_transfers=lazy_pin_cpu_transfers,
+                pinned_transfer_buffer=pinned_transfer_buffer,
             )
             stage = _StreamingStage(
                 display_name=qualified_name,
@@ -1685,6 +1832,7 @@ def apply_cpu_streaming_(
     ddp_kwargs: Optional[Mapping[str, Any]] = None,
     close_rank: int = 0,
     collect_timing: Optional[bool] = None,
+    pin_cpu_masters: PinCpuMasters = True,
 ) -> CPUStreamingEngine:
     """Transform ``model.<module_path>`` in place and return a training engine.
 
@@ -1719,6 +1867,11 @@ def apply_cpu_streaming_(
     collect_timing:
         When true, collect per-transfer enqueue time, byte counts, and CUDA event
         durations.  If omitted, ``DTAI_PARALLEL_TIMING=1`` enables collection.
+    pin_cpu_masters:
+        ``True`` or ``"eager"`` pins hidden CPU master tensors during setup for
+        faster CUDA transfers. ``"lazy"`` pins each CPU source tensor immediately
+        before transfer, avoiding setup-time pinned-memory spikes. ``False``
+        disables pinning.
 
     Returns
     -------
@@ -1732,6 +1885,8 @@ def apply_cpu_streaming_(
     if collect_timing is None:
         collect_timing = os.environ.get("DTAI_PARALLEL_TIMING", "").lower() in {"1", "true", "yes", "on"}
     metrics = StreamingTransferMetrics(enabled=bool(collect_timing))
+    eager_pin_cpu_masters, lazy_pin_cpu_transfers = _normalize_pin_cpu_masters(pin_cpu_masters)
+    pinned_transfer_buffer = _PinnedTransferBuffer() if lazy_pin_cpu_transfers else None
 
     parent, child_name, target = _resolve_module_path(model, module_path)
     streaming_container = _build_streaming_container(
@@ -1743,6 +1898,9 @@ def apply_cpu_streaming_(
         metrics=metrics,
         grad_norm_type=grad_norm_type,
         track_grad_norms=max_grad_norm is not None,
+        eager_pin_cpu_masters=eager_pin_cpu_masters,
+        lazy_pin_cpu_transfers=lazy_pin_cpu_transfers,
+        pinned_transfer_buffer=pinned_transfer_buffer,
     )
     _set_module_path(parent, child_name, streaming_container)
 
