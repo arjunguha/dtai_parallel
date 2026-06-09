@@ -228,6 +228,7 @@ def train_single_process_streaming(
     max_grad_norm: Optional[float],
     steps: int,
     device: torch.device,
+    pin_cpu_masters=True,
 ) -> nn.Module:
     model = copy.deepcopy(initial_model)
     engine = apply_cpu_streaming_(
@@ -240,6 +241,7 @@ def train_single_process_streaming(
         device=device,
         wrap_ddp=False,
         auto_init_process_group=False,
+        pin_cpu_masters=pin_cpu_masters,
     )
     criterion = nn.MSELoss()
     for _ in range(steps):
@@ -290,6 +292,45 @@ def test_in_place_transform_matches_single_process_reference(container_kind: str
         steps=2,
         device=device,
     )
+    assert_state_dicts_close(streaming.state_dict(), reference.state_dict(), dtype=dtype)
+
+
+@pytest.mark.parametrize("pin_cpu_masters", ["eager", "lazy", False])
+def test_one_gpu_cuda_streaming_matches_single_process_reference(pin_cpu_masters) -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        pytest.skip("needs exactly one CUDA device")
+
+    dtype = torch.float32
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+    initial_model = SandwichModel(dtype=dtype)
+    xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
+    optimizer_kwargs = optimizer_kwargs_for("adamw")
+
+    reference = train_single_process_reference(
+        initial_model,
+        xs_cpu,
+        ys_cpu,
+        optimizer_name="adamw",
+        optimizer_kwargs=optimizer_kwargs,
+        max_grad_norm=0.5,
+        steps=2,
+        device=device,
+    )
+    streaming = train_single_process_streaming(
+        initial_model,
+        "layers",
+        xs_cpu,
+        ys_cpu,
+        offload_policy=[True, False, True],
+        optimizer_name="adamw",
+        optimizer_kwargs=optimizer_kwargs,
+        max_grad_norm=0.5,
+        steps=2,
+        device=device,
+        pin_cpu_masters=pin_cpu_masters,
+    )
+
     assert_state_dicts_close(streaming.state_dict(), reference.state_dict(), dtype=dtype)
 
 

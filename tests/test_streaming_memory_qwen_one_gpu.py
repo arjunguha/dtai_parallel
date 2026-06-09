@@ -54,6 +54,7 @@ class QwenMemoryRow:
     resident_gib: float
     measured_cpu_peak_gib: float
     measured_cuda_peak_gib: float
+    step_seconds: Tuple[float, ...]
     average_step_seconds: float
 
     @property
@@ -117,6 +118,9 @@ def print_qwen_memory_table(rows: List[QwenMemoryRow]) -> None:
         ("resident (GiB)", 14, "right"),
         ("CPU RSS (GiB)", 15, "right"),
         ("CUDA peak (GiB)", 16, "right"),
+        ("step 1 (s)", 10, "right"),
+        ("step 2 (s)", 10, "right"),
+        ("step 3 (s)", 10, "right"),
         ("avg step (s)", 12, "right"),
     ]
 
@@ -138,6 +142,9 @@ def print_qwen_memory_table(rows: List[QwenMemoryRow]) -> None:
             f"{row.resident_gib:.3f}",
             f"{row.measured_cpu_peak_gib:.3f}",
             f"{row.measured_cuda_peak_gib:.3f}",
+            f"{row.step_seconds[0]:.3f}",
+            f"{row.step_seconds[1]:.3f}",
+            f"{row.step_seconds[2]:.3f}",
             f"{row.average_step_seconds:.3f}",
         ]
         print(
@@ -269,6 +276,7 @@ def run_one_gpu_qwen_memory_case(seq_len: int) -> QwenMemoryRow:
         resident_gib=gib(resident_bytes),
         measured_cpu_peak_gib=gib(cpu_peak),
         measured_cuda_peak_gib=gib(cuda_peak),
+        step_seconds=tuple(step_seconds),
         average_step_seconds=average_step_seconds,
     )
 
