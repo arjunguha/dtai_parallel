@@ -448,6 +448,39 @@ def _reference_ddp_worker(
         dist.destroy_process_group()
 
 
+def _standard_training_worker(
+    rank: int,
+    result_file: str,
+    initial_state: Mapping[str, Tensor],
+    xs_cpu: Sequence[Tensor],
+    ys_cpu: Sequence[Tensor],
+    optimizer_name: str,
+    optimizer_kwargs: Mapping[str, object],
+    max_grad_norm: Optional[float],
+    steps: int,
+    dtype: torch.dtype,
+    use_cuda: bool,
+) -> None:
+    del rank
+    device = torch.device("cuda:0") if use_cuda else torch.device("cpu")
+    if use_cuda:
+        torch.cuda.set_device(device)
+    model = SandwichModel(dtype=dtype).to(device)
+    model.load_state_dict(initial_state, strict=True)
+    optimizer = optimizer_cls_for(optimizer_name)(model.parameters(), **dict(optimizer_kwargs))
+    criterion = nn.MSELoss()
+    x = torch.cat(list(xs_cpu), dim=0)
+    y = torch.cat(list(ys_cpu), dim=0)
+    for _ in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        loss = criterion(model(x.to(device)), y.to(device))
+        loss.backward()
+        if max_grad_norm is not None:
+            clip_grad_norm_(model.parameters(), max_grad_norm, foreach=False)
+        optimizer.step()
+    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, result_file)
+
+
 def _streaming_ddp_worker(
     rank: int,
     world_size: int,
@@ -542,6 +575,72 @@ def test_streamed_modulelist_inside_larger_model_matches_real_ddp(device_kind: s
                 use_cuda,
             ),
             nprocs=world_size,
+            start_method="spawn",
+            join=True,
+        )
+        mp.start_processes(
+            _streaming_ddp_worker,
+            args=(
+                world_size,
+                init_stream,
+                result_stream,
+                initial_model.state_dict(),
+                xs_cpu,
+                ys_cpu,
+                optimizer_name,
+                optimizer_kwargs,
+                max_grad_norm,
+                steps,
+                dtype,
+                use_cuda,
+            ),
+            nprocs=world_size,
+            start_method="spawn",
+            join=True,
+        )
+        ref_state = torch.load(result_ref, map_location="cpu")
+        stream_state = torch.load(result_stream, map_location="cpu")
+
+    assert_state_dicts_close(stream_state, ref_state, dtype=dtype)
+
+
+@pytest.mark.parametrize("device_kind", ["cpu", "cuda"])
+def test_streamed_modulelist_inside_larger_model_matches_standard_training_loop(device_kind: str) -> None:
+    if device_kind == "cuda" and (not torch.cuda.is_available() or torch.cuda.device_count() < 2):
+        pytest.skip("needs at least two CUDA devices")
+
+    use_cuda = device_kind == "cuda"
+    dtype = torch.float32 if use_cuda else torch.float64
+    world_size = 2
+    initial_model = SandwichModel(dtype=dtype)
+    xs_cpu, ys_cpu = make_batches(world_size=world_size, dtype=dtype)
+    optimizer_name = "adamw"
+    optimizer_kwargs = optimizer_kwargs_for(optimizer_name)
+    max_grad_norm = 0.5
+    steps = 2
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_stream = os.path.join(tmpdir, "stream_init")
+        result_ref = os.path.join(tmpdir, "ref.pt")
+        result_stream = os.path.join(tmpdir, "stream.pt")
+        if os.path.exists(init_stream):
+            os.unlink(init_stream)
+
+        mp.start_processes(
+            _standard_training_worker,
+            args=(
+                result_ref,
+                initial_model.state_dict(),
+                xs_cpu,
+                ys_cpu,
+                optimizer_name,
+                optimizer_kwargs,
+                max_grad_norm,
+                steps,
+                dtype,
+                use_cuda,
+            ),
+            nprocs=1,
             start_method="spawn",
             join=True,
         )
