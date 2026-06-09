@@ -423,10 +423,12 @@ def test_streaming_peak_memory_is_bounded_by_layerwise_offload(
     assert transfer_h2d_bytes > 0
     assert transfer_d2h_bytes > 0
 
-    # Offloaded AdamW state lives on CPU: weights, transient gradients, and two moments.
+    # Offloaded AdamW state lives on CPU: weights, accumulated gradients, and
+    # two moments.  CUDA-only gradient math stages one layer at a time, which can
+    # leave one extra layer-sized pinned CPU transfer buffer live around samples.
     assert cpu_peak >= int(0.85 * expected_cpu_peak)
     if layer_param_scale == 1.0:
-        assert cpu_peak <= int(1.35 * expected_cpu_peak)
+        assert cpu_peak <= int(1.35 * expected_cpu_peak + largest_layer_bytes)
     else:
         full_cpu_peak_gib = MEASURED_CPU_PEAK_GIB[(num_layers, 1.0)]
         assert measured_cpu_peak_gib < full_cpu_peak_gib
@@ -434,7 +436,7 @@ def test_streaming_peak_memory_is_bounded_by_layerwise_offload(
     post_first_step = records[1:]
     assert any(record["cpu_rss_peak_bytes"] >= int(0.85 * expected_cpu_peak) for record in post_first_step)
 
-    # CUDA peak is dominated by optimizer.step(): staged weights, accumulated
+    # CUDA peak is dominated by optimizer.step(): staged weights, layer-scoped
     # device gradients, and AdamW state for the largest offloaded layer, plus the
     # resident modules that already live on device with their own AdamW state.
     assert cuda_peak >= int(0.85 * expected_cuda_peak)

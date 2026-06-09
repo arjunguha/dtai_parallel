@@ -278,38 +278,35 @@ def _copy_tensor_to_cpu(
     return out
 
 
-def _clip_grad_tensors_(
-    gradients: Iterable[Tensor],
-    *,
-    max_norm: float,
-    norm_type: float,
-    error_if_nonfinite: bool,
-    device: torch.device,
-) -> Tensor:
+def _grad_total_norm(gradients: Iterable[Tensor], *, norm_type: float, device: torch.device) -> Optional[Tensor]:
     grads = [grad for grad in gradients if grad is not None]
     if not grads:
-        return torch.zeros((), device=device)
-
+        return None
     if norm_type == float("inf"):
-        total_norm = torch.stack([grad.detach().abs().max().to(device) for grad in grads]).max()
-    else:
-        total_norm = torch.linalg.vector_norm(
-            torch.stack([torch.linalg.vector_norm(grad.detach(), ord=norm_type).to(device) for grad in grads]),
-            ord=norm_type,
-        )
+        return torch.stack([grad.detach().abs().max().to(device) for grad in grads]).max()
+    return torch.linalg.vector_norm(
+        torch.stack([torch.linalg.vector_norm(grad.detach(), ord=norm_type).to(device) for grad in grads]),
+        ord=norm_type,
+    )
 
+
+def _combine_grad_norms(norms: Iterable[Optional[Tensor]], *, norm_type: float, device: torch.device) -> Tensor:
+    present = [norm.to(device) for norm in norms if norm is not None]
+    if not present:
+        return torch.zeros((), device=device)
+    if norm_type == float("inf"):
+        return torch.stack(present).max()
+    return torch.linalg.vector_norm(torch.stack(present), ord=norm_type)
+
+
+def _clip_coef(total_norm: Tensor, *, max_norm: float, error_if_nonfinite: bool) -> Tensor:
     if error_if_nonfinite and not bool(torch.isfinite(total_norm).item()):
         raise RuntimeError(
-            f"The total norm of order {norm_type} for gradients from `parameters` is non-finite, "
+            "The total norm of order for gradients from `parameters` is non-finite, "
             "so it cannot be clipped. To disable this error and scale the gradients by the non-finite norm anyway, "
             "set `error_if_nonfinite=False`"
         )
-
-    clip_coef = torch.as_tensor(float(max_norm), device=device) / (total_norm + 1e-6)
-    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
-    for grad in grads:
-        grad.mul_(clip_coef_clamped.to(grad.device))
-    return total_norm
+    return torch.clamp(torch.as_tensor(float(max_norm), device=total_norm.device) / (total_norm + 1e-6), max=1.0)
 
 
 class _RNGSnapshot:
@@ -722,7 +719,6 @@ class _OffloadedModuleHandle:
         self._prefetched: Optional[_PrefetchedState] = None
         self._prefetch_streams: Dict[Tuple[int, bool], torch.cuda.Stream] = {}
         self._pending_grad_copies: Dict[str, List[_PendingGradCopy]] = {}
-        self._device_grads: Dict[str, Tensor] = {}
 
     @property
     def parameters_by_name(self) -> "OrderedDict[str, nn.Parameter]":
@@ -737,7 +733,6 @@ class _OffloadedModuleHandle:
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         self._discard_pending_grad_copies()
-        self._device_grads = {}
         for parameter in self.parameters_by_name.values():
             if set_to_none:
                 parameter.grad = None
@@ -847,12 +842,18 @@ class _OffloadedModuleHandle:
                 target = parameters[name]
                 if grad.device.type == "cuda" and self.local_device.type == "cuda":
                     grad_detached = grad.detach()
-                    accumulated = self._device_grads.get(name)
-                    if accumulated is None:
-                        accumulated = grad_detached.clone(memory_format=torch.preserve_format)
-                        self._device_grads[name] = accumulated
+                    if target.grad is None:
+                        accumulated = grad_detached
                     else:
+                        accumulated = _copy_tensor_to_device(
+                            target.grad.detach(),
+                            grad_detached.device,
+                            metrics=self.metrics,
+                            kind="grad_accum_h2d",
+                        )
                         accumulated.add_(grad_detached)
+                    target.grad = _copy_tensor_to_cpu(accumulated, metrics=self.metrics, kind="grad_d2h", like=target)
+                    torch.cuda.current_stream(grad_detached.device).synchronize()
                 elif target.grad is None:
                     target.grad = grad.detach().clone()
                 else:
@@ -889,8 +890,18 @@ class _OffloadedModuleHandle:
 
         if self.local_device.type == "cuda":
             if _distributed_is_active(self.process_group):
-                for name, grad in list(self._device_grads.items()):
-                    self._device_grads[name] = _all_reduce_mean_(grad, self.local_device, self.process_group).detach()
+                for parameter in self.parameters_by_name.values():
+                    if parameter.grad is None:
+                        continue
+                    staged_grad = _copy_tensor_to_device(
+                        parameter.grad.detach(),
+                        self.local_device,
+                        metrics=self.metrics,
+                        kind="grad_reduce_h2d",
+                    )
+                    reduced = _all_reduce_mean_(staged_grad, self.local_device, self.process_group).detach()
+                    parameter.grad = _copy_tensor_to_cpu(reduced, metrics=self.metrics, kind="grad_reduce_d2h", like=parameter)
+                    torch.cuda.current_stream(self.local_device).synchronize()
             return
 
         self.flush_pending_gradients()
@@ -901,13 +912,22 @@ class _OffloadedModuleHandle:
                 continue
             parameter.grad = _all_reduce_mean_(parameter.grad, self.local_device, self.process_group).detach().cpu()
 
-    def offloaded_gradients_for_clipping(self) -> Iterator[Tensor]:
-        if self.local_device.type == "cuda":
-            yield from self._device_grads.values()
-        else:
-            for parameter in self.parameters_by_name.values():
-                if parameter.grad is not None:
-                    yield parameter.grad
+    def offloaded_grad_norm(self, *, device: torch.device, norm_type: float) -> Optional[Tensor]:
+        if device.type != "cuda":
+            return _grad_total_norm((parameter.grad for parameter in self.parameters_by_name.values()), norm_type=norm_type, device=device)
+        staged_grads: List[Tensor] = []
+        for parameter in self.parameters_by_name.values():
+            if parameter.grad is None:
+                continue
+            staged_grads.append(
+                _copy_tensor_to_device(
+                    parameter.grad.detach(),
+                    device,
+                    metrics=self.metrics,
+                    kind="grad_norm_h2d",
+                )
+            )
+        return _grad_total_norm(staged_grads, norm_type=norm_type, device=device)
 
     def evict_device(self, device: torch.device) -> None:
         """Drop temporary staged state owned by this prototype."""
@@ -920,6 +940,7 @@ class _OffloadedModuleHandle:
         optimizer_cls: Type[torch.optim.Optimizer],
         optimizer_kwargs: Mapping[str, Any],
         optimizer_device: torch.device,
+        clip_coef: Optional[Tensor],
     ) -> None:
         """Run a PyTorch optimizer for this stage on its owner rank.
 
@@ -951,25 +972,15 @@ class _OffloadedModuleHandle:
                     ),
                     requires_grad=cpu_parameter.requires_grad,
                 )
-                device_grad = self._device_grads.get(name)
-                if device_grad is not None:
-                    staged.grad = (
-                        device_grad.detach().clone(memory_format=torch.preserve_format)
-                        if device_grad.device == optimizer_device
-                        else _copy_tensor_to_device(
-                            device_grad.detach(),
-                            optimizer_device,
-                            metrics=self.metrics,
-                            kind="optimizer_grad_h2d",
-                        )
-                    )
-                elif cpu_parameter.grad is not None:
+                if cpu_parameter.grad is not None:
                     staged.grad = _copy_tensor_to_device(
                         cpu_parameter.grad.detach(),
                         optimizer_device,
                         metrics=self.metrics,
                         kind="optimizer_grad_h2d",
                     )
+                    if clip_coef is not None:
+                        staged.grad.mul_(clip_coef.to(staged.grad.device))
                 staged_parameters.append(staged)
 
             optimizer = optimizer_cls(staged_parameters, **dict(optimizer_kwargs))
@@ -1002,7 +1013,6 @@ class _OffloadedModuleHandle:
         for _, cpu_parameter in named_parameters:
             _broadcast_tensor_(cpu_parameter.data, src=owner, local_device=self.local_device, process_group=self.process_group)
             cpu_parameter.grad = None
-        self._device_grads = {}
 
     def materialize(self, device: torch.device) -> nn.Module:
         return copy.deepcopy(self.module).to(device)
@@ -1421,16 +1431,26 @@ class CPUStreamingEngine:
                 params.extend(group["params"])
         return [parameter for parameter in params if parameter.requires_grad]
 
-    def _cuda_gradients_for_clipping(self) -> List[Tensor]:
-        gradients: List[Tensor] = []
+    def _cuda_total_grad_norm(self) -> Tensor:
+        norms: List[Optional[Tensor]] = []
         for handle in self.handles:
-            gradients.extend(handle.offloaded_gradients_for_clipping())
+            norms.append(handle.offloaded_grad_norm(device=self.local_device, norm_type=self.grad_norm_type))
         if self.resident_optimizer is not None:
+            resident_gradients: List[Tensor] = []
             for group in self.resident_optimizer.param_groups:
                 for parameter in group["params"]:
                     if parameter.grad is not None:
-                        gradients.append(parameter.grad)
-        return gradients
+                        resident_gradients.append(parameter.grad)
+            norms.append(_grad_total_norm(resident_gradients, norm_type=self.grad_norm_type, device=self.local_device))
+        return _combine_grad_norms(norms, norm_type=self.grad_norm_type, device=self.local_device)
+
+    def _scale_resident_cuda_gradients_(self, clip_coef: Tensor) -> None:
+        if self.resident_optimizer is None:
+            return
+        for group in self.resident_optimizer.param_groups:
+            for parameter in group["params"]:
+                if parameter.grad is not None:
+                    parameter.grad.mul_(clip_coef.to(parameter.grad.device))
 
     def step(self) -> Optional[Tensor]:
         """Synchronize offloaded gradients, optionally clip, and run optimizers."""
@@ -1442,15 +1462,16 @@ class CPUStreamingEngine:
             handle.synchronize_gradients()
 
         total_norm: Optional[Tensor]
+        cuda_clip_coef: Optional[Tensor] = None
         if self.max_grad_norm is not None:
             if self.local_device.type == "cuda":
-                total_norm = _clip_grad_tensors_(
-                    self._cuda_gradients_for_clipping(),
+                total_norm = self._cuda_total_grad_norm()
+                cuda_clip_coef = _clip_coef(
+                    total_norm,
                     max_norm=float(self.max_grad_norm),
-                    norm_type=self.grad_norm_type,
                     error_if_nonfinite=self.error_if_nonfinite,
-                    device=self.local_device,
                 )
+                self._scale_resident_cuda_gradients_(cuda_clip_coef)
             else:
                 total_norm = clip_grad_norm_(
                     self._parameters_for_clipping(),
@@ -1471,6 +1492,7 @@ class CPUStreamingEngine:
                 optimizer_cls=self.optimizer_cls,
                 optimizer_kwargs=self.optimizer_kwargs,
                 optimizer_device=self.optimizer_device,
+                clip_coef=cuda_clip_coef,
             )
 
         self.streaming_container.clear_prefetch()
