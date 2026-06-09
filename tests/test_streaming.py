@@ -438,11 +438,12 @@ def test_cuda_transfer_timing_records_streamed_copies() -> None:
     closed = engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
     assert closed is not None
 
-    for kind in ("state_h2d", "grad_d2h", "optimizer_param_h2d", "optimizer_param_d2h"):
+    for kind in ("state_h2d", "optimizer_param_h2d", "optimizer_param_d2h"):
         assert kind in timings
         assert timings[kind]["calls"] > 0
         assert timings[kind]["bytes"] > 0
         assert timings[kind]["enqueue_ms"] >= 0.0
+    assert "grad_d2h" not in timings
 
     assert any(handle._prefetch_streams for handle in engine.handles)
 

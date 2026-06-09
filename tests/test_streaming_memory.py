@@ -434,9 +434,9 @@ def test_streaming_peak_memory_is_bounded_by_layerwise_offload(
     post_first_step = records[1:]
     assert any(record["cpu_rss_peak_bytes"] >= int(0.85 * expected_cpu_peak) for record in post_first_step)
 
-    # CUDA peak is dominated by optimizer.step(): staged weights, gradients, and AdamW
-    # state for the largest offloaded layer, plus the resident modules that already
-    # live on device with their own AdamW state.
+    # CUDA peak is dominated by optimizer.step(): staged weights, accumulated
+    # device gradients, and AdamW state for the largest offloaded layer, plus the
+    # resident modules that already live on device with their own AdamW state.
     assert cuda_peak >= int(0.85 * expected_cuda_peak)
 
     if layer_param_scale == 0.5:
