@@ -45,6 +45,7 @@ from __future__ import annotations
 import copy
 import os
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Type, Union
@@ -87,6 +88,81 @@ class StreamingConfig:
     rank: int
 
 
+class StreamingTransferMetrics:
+    """Low-overhead transfer timing counters collected by the streaming engine."""
+
+    def __init__(self, *, enabled: bool = False) -> None:
+        self.enabled = bool(enabled)
+        self._lock = threading.Lock()
+        self._counters: Dict[str, Dict[str, float]] = {}
+        self._pending_cuda_events: List[Tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+
+    def _counter_for(self, kind: str) -> Dict[str, float]:
+        counter = self._counters.get(kind)
+        if counter is None:
+            counter = {"calls": 0.0, "bytes": 0.0, "enqueue_ms": 0.0, "cuda_ms": 0.0}
+            self._counters[kind] = counter
+        return counter
+
+    def record_copy(self, kind: str, byte_count: int, device: torch.device, copy_fn: Callable[[], Any]) -> Any:
+        if not self.enabled:
+            return copy_fn()
+
+        start_event: Optional[torch.cuda.Event] = None
+        end_event: Optional[torch.cuda.Event] = None
+        if device.type == "cuda":
+            stream = torch.cuda.current_stream(device)
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(stream)
+
+        start = time.perf_counter()
+        result = copy_fn()
+        enqueue_ms = (time.perf_counter() - start) * 1000.0
+
+        with self._lock:
+            counter = self._counter_for(kind)
+            counter["calls"] += 1.0
+            counter["bytes"] += float(byte_count)
+            counter["enqueue_ms"] += enqueue_ms
+            if start_event is not None and end_event is not None:
+                end_event.record(torch.cuda.current_stream(device))
+                self._pending_cuda_events.append((kind, start_event, end_event))
+
+        return result
+
+    def _finalize_cuda_events(self, *, synchronize: bool) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            pending = self._pending_cuda_events
+            self._pending_cuda_events = []
+
+        still_pending: List[Tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        completed: List[Tuple[str, float]] = []
+        for kind, start_event, end_event in pending:
+            if synchronize:
+                end_event.synchronize()
+            elif not end_event.query():
+                still_pending.append((kind, start_event, end_event))
+                continue
+            completed.append((kind, float(start_event.elapsed_time(end_event))))
+
+        with self._lock:
+            for kind, cuda_ms in completed:
+                self._counter_for(kind)["cuda_ms"] += cuda_ms
+            self._pending_cuda_events.extend(still_pending)
+
+    def summary(self, *, reset: bool = False, synchronize: bool = True) -> Dict[str, Dict[str, float]]:
+        self._finalize_cuda_events(synchronize=synchronize)
+        with self._lock:
+            snapshot = {kind: dict(values) for kind, values in sorted(self._counters.items())}
+            if reset:
+                self._counters = {}
+                self._pending_cuda_events = []
+        return snapshot
+
+
 class _Tree:
     """Move opaque PyTorch optimizer state between devices.
 
@@ -98,28 +174,108 @@ class _Tree:
     """
 
     @staticmethod
-    def to_device(value: Any, device: torch.device) -> Any:
+    def to_device(
+        value: Any,
+        device: torch.device,
+        *,
+        metrics: Optional[StreamingTransferMetrics] = None,
+        kind: str = "optimizer_state_h2d",
+    ) -> Any:
         if torch.is_tensor(value):
-            return value.detach().to(device, non_blocking=True).clone()
+            return _copy_tensor_to_device(value.detach(), device, metrics=metrics, kind=kind)
         if isinstance(value, dict):
-            return {k: _Tree.to_device(v, device) for k, v in value.items()}
+            return {k: _Tree.to_device(v, device, metrics=metrics, kind=kind) for k, v in value.items()}
         if isinstance(value, list):
-            return [_Tree.to_device(v, device) for v in value]
+            return [_Tree.to_device(v, device, metrics=metrics, kind=kind) for v in value]
         if isinstance(value, tuple):
-            return tuple(_Tree.to_device(v, device) for v in value)
+            return tuple(_Tree.to_device(v, device, metrics=metrics, kind=kind) for v in value)
         return copy.deepcopy(value)
 
     @staticmethod
-    def detach_cpu(value: Any) -> Any:
+    def detach_cpu(
+        value: Any,
+        *,
+        metrics: Optional[StreamingTransferMetrics] = None,
+        kind: str = "optimizer_state_d2h",
+    ) -> Any:
         if torch.is_tensor(value):
-            return value.detach().cpu().clone()
+            return _copy_tensor_to_cpu(value.detach(), metrics=metrics, kind=kind)
         if isinstance(value, dict):
-            return {k: _Tree.detach_cpu(v) for k, v in value.items()}
+            return {k: _Tree.detach_cpu(v, metrics=metrics, kind=kind) for k, v in value.items()}
         if isinstance(value, list):
-            return [_Tree.detach_cpu(v) for v in value]
+            return [_Tree.detach_cpu(v, metrics=metrics, kind=kind) for v in value]
         if isinstance(value, tuple):
-            return tuple(_Tree.detach_cpu(v) for v in value)
+            return tuple(_Tree.detach_cpu(v, metrics=metrics, kind=kind) for v in value)
         return copy.deepcopy(value)
+
+
+def _tensor_nbytes(tensor: Tensor) -> int:
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _pin_tensor_if_possible(tensor: Tensor) -> Tensor:
+    if tensor.device.type != "cpu" or tensor.is_pinned():
+        return tensor
+    try:
+        return tensor.pin_memory()
+    except RuntimeError:
+        return tensor
+
+
+def _pin_module_cpu_tensors_if_possible_(module: nn.Module) -> None:
+    for parameter in module.parameters(recurse=True):
+        parameter.data = _pin_tensor_if_possible(parameter.detach())
+    for buffer in module.buffers(recurse=True):
+        buffer.data = _pin_tensor_if_possible(buffer.detach())
+
+
+def _copy_tensor_to_device(
+    tensor: Tensor,
+    device: torch.device,
+    *,
+    metrics: Optional[StreamingTransferMetrics],
+    kind: str,
+) -> Tensor:
+    byte_count = _tensor_nbytes(tensor)
+
+    def copy_fn() -> Tensor:
+        return tensor.to(device=device, non_blocking=True, copy=True)
+
+    if metrics is None:
+        return copy_fn()
+    return metrics.record_copy(kind, byte_count, device, copy_fn)
+
+
+def _empty_cpu_like(tensor: Tensor, *, pin_memory: bool) -> Tensor:
+    try:
+        return torch.empty_like(tensor, device=torch.device("cpu"), memory_format=torch.preserve_format, pin_memory=pin_memory)
+    except (RuntimeError, TypeError):
+        return torch.empty_like(tensor, device=torch.device("cpu"), memory_format=torch.preserve_format)
+
+
+def _copy_tensor_to_cpu(
+    tensor: Tensor,
+    *,
+    metrics: Optional[StreamingTransferMetrics],
+    kind: str,
+    like: Optional[Tensor] = None,
+) -> Tensor:
+    if tensor.device.type == "cpu":
+        return tensor.detach().clone()
+
+    pin_memory = bool(tensor.device.type == "cuda" and (like is None or (like.device.type == "cpu" and like.is_pinned())))
+    out = _empty_cpu_like(tensor, pin_memory=pin_memory)
+    byte_count = _tensor_nbytes(tensor)
+
+    def copy_fn() -> Tensor:
+        out.copy_(tensor, non_blocking=True)
+        return out
+
+    if metrics is None:
+        copy_fn()
+    else:
+        metrics.record_copy(kind, byte_count, tensor.device, copy_fn)
+    return out
 
 
 class _RNGSnapshot:
@@ -490,6 +646,12 @@ class _PrefetchedState:
         return self.state
 
 
+@dataclass
+class _PendingGradCopy:
+    tensor: Tensor
+    event: Optional[torch.cuda.Event]
+
+
 class _OffloadedModuleHandle:
     """Hidden CPU master state for one streamed layer.
 
@@ -508,18 +670,24 @@ class _OffloadedModuleHandle:
         owner_rank: int,
         local_device: torch.device,
         process_group: Optional[Any],
+        metrics: StreamingTransferMetrics,
     ) -> None:
         self.qualified_name = qualified_name
         self.stage_index = int(stage_index)
         self.owner_rank = int(owner_rank)
         self.local_device = local_device
         self.process_group = process_group
+        self.metrics = metrics
         self.module = copy.deepcopy(module).cpu()
+        if self.local_device.type == "cuda":
+            _pin_module_cpu_tensors_if_possible_(self.module)
         self.param_names = [name for name, _ in self.module.named_parameters(recurse=True)]
         self.buffer_names = [name for name, _ in self.module.named_buffers(recurse=True)]
         self.optimizer_state: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._prefetched: Optional[_PrefetchedState] = None
+        self._prefetch_streams: Dict[Tuple[int, bool], torch.cuda.Stream] = {}
+        self._pending_grad_copies: Dict[str, List[_PendingGradCopy]] = {}
 
     @property
     def parameters_by_name(self) -> "OrderedDict[str, nn.Parameter]":
@@ -533,6 +701,7 @@ class _OffloadedModuleHandle:
         self.module.train(mode)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        self._discard_pending_grad_copies()
         for parameter in self.parameters_by_name.values():
             if set_to_none:
                 parameter.grad = None
@@ -552,13 +721,24 @@ class _OffloadedModuleHandle:
     def _state_for_call(self, device: torch.device, requires_grad: bool) -> "OrderedDict[str, Tensor]":
         state: "OrderedDict[str, Tensor]" = OrderedDict()
         for name, parameter in self.parameters_by_name.items():
-            streamed = parameter.detach().to(device, non_blocking=True).clone()
+            streamed = _copy_tensor_to_device(parameter.detach(), device, metrics=self.metrics, kind="state_h2d")
             if requires_grad and parameter.requires_grad:
                 streamed.requires_grad_(True)
             state[name] = streamed
         for name, buffer in self.buffers_by_name.items():
-            state[name] = buffer.detach().to(device, non_blocking=True).clone()
+            state[name] = _copy_tensor_to_device(buffer.detach(), device, metrics=self.metrics, kind="state_h2d")
         return state
+
+    def _prefetch_stream(self, device: torch.device, requires_grad: bool) -> torch.cuda.Stream:
+        index = device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        key = (int(index), bool(requires_grad))
+        stream = self._prefetch_streams.get(key)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._prefetch_streams[key] = stream
+        return stream
 
     def clear_prefetch(self) -> None:
         with self._lock:
@@ -581,7 +761,7 @@ class _OffloadedModuleHandle:
                 return
 
         if device.type == "cuda":
-            stream = torch.cuda.Stream(device=device)
+            stream = self._prefetch_stream(device, requires_grad)
             with torch.cuda.stream(stream):
                 state = self._state_for_call(device, requires_grad)
                 event = torch.cuda.Event()
@@ -629,15 +809,54 @@ class _OffloadedModuleHandle:
                 if grad is None:
                     continue
                 target = parameters[name]
-                grad_cpu = grad.detach().to("cpu", non_blocking=True)
-                if target.grad is None:
-                    target.grad = grad_cpu.clone()
+                if grad.device.type == "cuda":
+                    grad_detached = grad.detach()
+                    grad_cpu = _copy_tensor_to_cpu(
+                        grad_detached,
+                        metrics=self.metrics,
+                        kind="grad_d2h",
+                        like=target,
+                    )
+                    event = torch.cuda.Event()
+                    stream = torch.cuda.current_stream(grad_detached.device)
+                    event.record(stream)
+                    grad_detached.record_stream(stream)
+                    self._pending_grad_copies.setdefault(name, []).append(_PendingGradCopy(tensor=grad_cpu, event=event))
+                elif target.grad is None:
+                    target.grad = grad.detach().clone()
                 else:
-                    target.grad.add_(grad_cpu)
+                    target.grad.add_(grad.detach())
+
+    def _discard_pending_grad_copies(self) -> None:
+        with self._lock:
+            pending = self._pending_grad_copies
+            self._pending_grad_copies = {}
+        for copies in pending.values():
+            for pending_copy in copies:
+                if pending_copy.event is not None:
+                    pending_copy.event.synchronize()
+
+    def flush_pending_gradients(self) -> None:
+        with self._lock:
+            pending = self._pending_grad_copies
+            self._pending_grad_copies = {}
+        if not pending:
+            return
+        parameters = self.parameters_by_name
+        for name, copies in pending.items():
+            target = parameters[name]
+            for pending_copy in copies:
+                if pending_copy.event is not None:
+                    pending_copy.event.synchronize()
+                if target.grad is None:
+                    target.grad = pending_copy.tensor
+                else:
+                    target.grad.add_(pending_copy.tensor)
 
     def synchronize_gradients(self) -> None:
         """Average accumulated CPU gradients across torchrun ranks."""
 
+        self.flush_pending_gradients()
         if not _distributed_is_active(self.process_group):
             return
         for parameter in self.parameters_by_name.values():
@@ -649,8 +868,6 @@ class _OffloadedModuleHandle:
         """Drop temporary staged state owned by this prototype."""
 
         self.clear_prefetch()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     def optimizer_step(
         self,
@@ -669,6 +886,7 @@ class _OffloadedModuleHandle:
         """
 
         self.clear_prefetch()
+        self.flush_pending_gradients()
         named_parameters = list(self.parameters_by_name.items())
         if not named_parameters:
             return
@@ -679,25 +897,46 @@ class _OffloadedModuleHandle:
             staged_parameters: List[nn.Parameter] = []
             for _, cpu_parameter in named_parameters:
                 staged = nn.Parameter(
-                    cpu_parameter.detach().to(optimizer_device, non_blocking=True).clone(),
+                    _copy_tensor_to_device(
+                        cpu_parameter.detach(),
+                        optimizer_device,
+                        metrics=self.metrics,
+                        kind="optimizer_param_h2d",
+                    ),
                     requires_grad=cpu_parameter.requires_grad,
                 )
                 if cpu_parameter.grad is not None:
-                    staged.grad = cpu_parameter.grad.detach().to(optimizer_device, non_blocking=True).clone()
+                    staged.grad = _copy_tensor_to_device(
+                        cpu_parameter.grad.detach(),
+                        optimizer_device,
+                        metrics=self.metrics,
+                        kind="optimizer_grad_h2d",
+                    )
                 staged_parameters.append(staged)
 
             optimizer = optimizer_cls(staged_parameters, **dict(optimizer_kwargs))
             for (name, _), staged in zip(named_parameters, staged_parameters):
                 saved_state = self.optimizer_state.get(name)
                 if saved_state is not None:
-                    optimizer.state[staged] = _Tree.to_device(saved_state, optimizer_device)
+                    optimizer.state[staged] = _Tree.to_device(saved_state, optimizer_device, metrics=self.metrics)
 
             optimizer.step()
 
             for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
-                cpu_parameter.data.copy_(staged.detach().cpu())
+                staged_detached = staged.detach()
+                self.metrics.record_copy(
+                    "optimizer_param_d2h",
+                    _tensor_nbytes(staged_detached),
+                    optimizer_device,
+                    lambda staged_detached=staged_detached, cpu_parameter=cpu_parameter: cpu_parameter.data.copy_(
+                        staged_detached, non_blocking=True
+                    ),
+                )
                 if staged in optimizer.state:
-                    self.optimizer_state[name] = _Tree.detach_cpu(optimizer.state[staged])
+                    self.optimizer_state[name] = _Tree.detach_cpu(optimizer.state[staged], metrics=self.metrics)
+
+            if optimizer_device.type == "cuda":
+                torch.cuda.current_stream(optimizer_device).synchronize()
 
             del optimizer, staged_parameters
             self.evict_device(optimizer_device)
@@ -1042,6 +1281,7 @@ class CPUStreamingEngine:
         wrap_ddp: bool,
         ddp_kwargs: Mapping[str, Any],
         close_rank: int,
+        metrics: StreamingTransferMetrics,
     ) -> None:
         self.root_model = root_model
         self.module_path = module_path
@@ -1055,6 +1295,7 @@ class CPUStreamingEngine:
         self.error_if_nonfinite = bool(error_if_nonfinite)
         self.process_group = process_group
         self.close_rank = int(close_rank)
+        self.transfer_metrics = metrics
         self._closed = False
 
         self.handles = list(streaming_container.offloaded_handles())
@@ -1156,6 +1397,16 @@ class CPUStreamingEngine:
         self.streaming_container.clear_prefetch()
         return total_norm
 
+    def transfer_timing_summary(self, *, reset: bool = False, synchronize: bool = True) -> Dict[str, Dict[str, float]]:
+        """Return accumulated transfer timing counters.
+
+        ``enqueue_ms`` is host-side time spent issuing copies.  ``cuda_ms`` is
+        measured with CUDA events and therefore reflects device-stream copy time
+        for transfers that ran on CUDA streams.
+        """
+
+        return self.transfer_metrics.summary(reset=reset, synchronize=synchronize)
+
     def offloaded_parameters(self) -> Iterator[nn.Parameter]:
         for handle in self.handles:
             yield from handle.parameters_by_name.values()
@@ -1215,6 +1466,7 @@ def _build_streaming_container(
     offload_policy: OffloadPolicy,
     local_device: torch.device,
     process_group: Optional[Any],
+    metrics: StreamingTransferMetrics,
 ) -> Union[CPUStreamingModuleList, CPUStreamingSequential]:
     if not isinstance(container, (nn.ModuleList, nn.Sequential)):
         raise TypeError(
@@ -1235,6 +1487,7 @@ def _build_streaming_container(
                 owner_rank=index % world,
                 local_device=local_device,
                 process_group=process_group,
+                metrics=metrics,
             )
             stage = _StreamingStage(
                 display_name=qualified_name,
@@ -1273,6 +1526,7 @@ def apply_cpu_streaming_(
     wrap_ddp: bool = True,
     ddp_kwargs: Optional[Mapping[str, Any]] = None,
     close_rank: int = 0,
+    collect_timing: Optional[bool] = None,
 ) -> CPUStreamingEngine:
     """Transform ``model.<module_path>`` in place and return a training engine.
 
@@ -1304,6 +1558,9 @@ def apply_cpu_streaming_(
         one, the transformed model is wrapped in ``DistributedDataParallel`` for
         all resident parameters.  The DDP-wrapped model is available as
         ``engine.model``.
+    collect_timing:
+        When true, collect per-transfer enqueue time, byte counts, and CUDA event
+        durations.  If omitted, ``DTAI_PARALLEL_TIMING=1`` enables collection.
 
     Returns
     -------
@@ -1314,6 +1571,9 @@ def apply_cpu_streaming_(
 
     local_device = _normalize_device(device) if device is not None else _infer_local_device()
     _maybe_auto_init_process_group(auto_init_process_group, local_device)
+    if collect_timing is None:
+        collect_timing = os.environ.get("DTAI_PARALLEL_TIMING", "").lower() in {"1", "true", "yes", "on"}
+    metrics = StreamingTransferMetrics(enabled=bool(collect_timing))
 
     parent, child_name, target = _resolve_module_path(model, module_path)
     streaming_container = _build_streaming_container(
@@ -1322,6 +1582,7 @@ def apply_cpu_streaming_(
         offload_policy=offload_policy,
         local_device=local_device,
         process_group=process_group,
+        metrics=metrics,
     )
     _set_module_path(parent, child_name, streaming_container)
 
@@ -1340,6 +1601,7 @@ def apply_cpu_streaming_(
         wrap_ddp=wrap_ddp,
         ddp_kwargs=dict(ddp_kwargs or {}),
         close_rank=close_rank,
+        metrics=metrics,
     )
 
 
@@ -1354,6 +1616,7 @@ __all__ = [
     "CPUStreamingModuleList",
     "CPUStreamingSequential",
     "StreamingConfig",
+    "StreamingTransferMetrics",
     "apply_cpu_streaming",
     "apply_cpu_streaming_",
     "apply_cpu_streaming_to_modulelist_",

@@ -77,6 +77,9 @@ class MemoryStudyRow:
     measured_cpu_peak_gib: float
     expected_cuda_peak_gib: float
     measured_cuda_peak_gib: float
+    measured_transfer_h2d_gib: float
+    measured_transfer_d2h_gib: float
+    measured_transfer_cuda_ms: float
 
     @property
     def scale_label(self) -> str:
@@ -179,6 +182,9 @@ def print_memory_comparison_table(rows: List[MemoryStudyRow]) -> None:
         ("exp CUDA", 10, "right"),
         ("meas CUDA", 10, "right"),
         ("CUDA ratio", 10, "right"),
+        ("H2D GiB", 9, "right"),
+        ("D2H GiB", 9, "right"),
+        ("copy ms", 9, "right"),
         ("exp CPU", 10, "right"),
         ("meas CPU", 10, "right"),
     ]
@@ -200,6 +206,9 @@ def print_memory_comparison_table(rows: List[MemoryStudyRow]) -> None:
             f"{row.expected_cuda_peak_gib:.3f}",
             f"{row.measured_cuda_peak_gib:.3f}",
             f"{row.cuda_ratio:.2f}x",
+            f"{row.measured_transfer_h2d_gib:.3f}",
+            f"{row.measured_transfer_d2h_gib:.3f}",
+            f"{row.measured_transfer_cuda_ms:.1f}",
             f"{row.expected_cpu_peak_gib:.3f}",
             f"{row.measured_cpu_peak_gib:.3f}",
         ]
@@ -268,6 +277,7 @@ def _streaming_memory_worker(
             device=device,
             auto_init_process_group=False,
             wrap_ddp=True,
+            collect_timing=True,
         )
         assert isinstance(engine.model, DDP)
 
@@ -289,11 +299,13 @@ def _streaming_memory_worker(
 
             engine.step()
             tracker.sample()
+            transfer_timing = engine.transfer_timing_summary(reset=True, synchronize=True)
 
             iteration_records.append(
                 {
                     "cpu_rss_peak_bytes": tracker.cpu_rss_peak,
                     "cuda_peak_bytes": tracker.cuda_peak,
+                    "transfer_timing": transfer_timing,
                 }
             )
 
@@ -365,6 +377,23 @@ def test_streaming_peak_memory_is_bounded_by_layerwise_offload(
 
     cpu_peak = max(record["cpu_rss_peak_bytes"] for record in records)
     cuda_peak = max(record["cuda_peak_bytes"] for record in records)
+    transfer_h2d_bytes = sum(
+        int(timing["bytes"])
+        for record in records
+        for kind, timing in record["transfer_timing"].items()
+        if kind.endswith("_h2d")
+    )
+    transfer_d2h_bytes = sum(
+        int(timing["bytes"])
+        for record in records
+        for kind, timing in record["transfer_timing"].items()
+        if kind.endswith("_d2h")
+    )
+    transfer_cuda_ms = sum(
+        float(timing["cuda_ms"])
+        for record in records
+        for timing in record["transfer_timing"].values()
+    )
 
     measured_cpu_peak_gib = gib(cpu_peak)
     measured_cuda_peak_gib = gib(cuda_peak)
@@ -385,8 +414,14 @@ def test_streaming_peak_memory_is_bounded_by_layerwise_offload(
             measured_cpu_peak_gib=measured_cpu_peak_gib,
             expected_cuda_peak_gib=gib(expected_cuda_peak),
             measured_cuda_peak_gib=measured_cuda_peak_gib,
+            measured_transfer_h2d_gib=gib(transfer_h2d_bytes),
+            measured_transfer_d2h_gib=gib(transfer_d2h_bytes),
+            measured_transfer_cuda_ms=transfer_cuda_ms,
         )
     )
+
+    assert transfer_h2d_bytes > 0
+    assert transfer_d2h_bytes > 0
 
     # Offloaded AdamW state lives on CPU: weights, transient gradients, and two moments.
     assert cpu_peak >= int(0.85 * expected_cpu_peak)

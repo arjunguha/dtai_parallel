@@ -29,3 +29,7 @@ dev = [
 pythonpath = ["src"]
 testpaths = ["tests"]
 norecursedirs = ["old0", "old1"]
+markers = [
+    "cuda: tests that require CUDA devices",
+    "slow: long-running tests",
+]

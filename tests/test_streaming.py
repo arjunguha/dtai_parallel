@@ -406,6 +406,47 @@ def test_forward_and_backward_prefetch_are_scheduled() -> None:
     assert counts.get(("layers.0", True), 0) >= 1, "backward should prefetch the previous offloaded stage"
 
 
+@pytest.mark.cuda
+def test_cuda_transfer_timing_records_streamed_copies() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+    model = SandwichModel(dtype=torch.float32)
+    engine = apply_cpu_streaming_(
+        model,
+        "layers",
+        offload_policy=True,
+        optimizer_cls=torch.optim.AdamW,
+        optimizer_kwargs=optimizer_kwargs_for("adamw"),
+        device=device,
+        auto_init_process_group=False,
+        wrap_ddp=False,
+        collect_timing=True,
+    )
+
+    criterion = nn.MSELoss()
+    x = torch.randn(4, 5, device=device)
+    y = torch.randn(4, 3, device=device)
+    engine.zero_grad(set_to_none=True)
+    loss = criterion(engine.model(x), y)
+    loss.backward()
+    engine.step()
+
+    timings = engine.transfer_timing_summary(synchronize=True)
+    closed = engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
+    assert closed is not None
+
+    for kind in ("state_h2d", "grad_d2h", "optimizer_param_h2d", "optimizer_param_d2h"):
+        assert kind in timings
+        assert timings[kind]["calls"] > 0
+        assert timings[kind]["bytes"] > 0
+        assert timings[kind]["enqueue_ms"] >= 0.0
+
+    assert any(handle._prefetch_streams for handle in engine.handles)
+
+
 def _reference_ddp_worker(
     rank: int,
     world_size: int,
