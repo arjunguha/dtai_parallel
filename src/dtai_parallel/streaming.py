@@ -721,6 +721,12 @@ def _maybe_auto_init_process_group(auto_init: bool, device: torch.device) -> Non
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         return
     backend = "nccl" if device.type == "cuda" else "gloo"
+    if backend == "nccl":
+        try:
+            dist.init_process_group(backend=backend, device_id=device)
+            return
+        except TypeError:
+            pass
     dist.init_process_group(backend=backend)
 
 
@@ -1027,10 +1033,11 @@ class _OffloadedModuleHandle:
         self.pinned_transfer_buffer = pinned_transfer_buffer
         self.shared_cpu_store = shared_cpu_store
         # The transformation replaces the original container in-place, so the
-        # hidden handle can take ownership of the original child module.  A
-        # deepcopy here briefly duplicates large offloaded layers before pinning,
-        # which can push Qwen-sized models over host memory limits.
-        self.module = module.cpu()
+        # hidden handle can take ownership of the original child module.  In
+        # distributed shared-CPU mode, do not call module.cpu() here: ranks that
+        # do not initialize the shared tensors would briefly materialize a full
+        # private CPU copy only to replace it with file-backed storage below.
+        self.module = module if self.shared_cpu_store is not None else module.cpu()
         if self.shared_cpu_store is not None:
             self._share_module_cpu_state_()
         if self.shared_cpu_store is None and eager_pin_cpu_masters and self.local_device.type == "cuda":
