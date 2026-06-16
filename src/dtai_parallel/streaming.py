@@ -68,6 +68,13 @@ PinCpuMasters = Union[bool, str]
 _SENTINEL = "__cpu_streaming_ddp_tensor_leaf__"
 
 
+def _env_flag(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class StreamingConfig:
     """A compact record of the engine configuration.
@@ -1161,8 +1168,9 @@ class _OffloadedModuleHandle:
         staged_parameters: List[nn.Parameter],
         optimizer: Optional[torch.optim.Optimizer],
         optimizer_device: torch.device,
+        async_commit: bool,
     ) -> None:
-        if optimizer_device.type != "cuda":
+        if optimizer_device.type != "cuda" or not async_commit:
             for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
                 cpu_parameter.data.copy_(staged.detach(), non_blocking=False)
                 if optimizer is not None and staged in optimizer.state:
@@ -1364,6 +1372,7 @@ class _OffloadedModuleHandle:
         optimizer_kwargs: Mapping[str, Any],
         optimizer_device: torch.device,
         clip_coef: Optional[Tensor],
+        async_commit: bool = True,
     ) -> None:
         """Run a PyTorch optimizer for this stage on its owner rank.
 
@@ -1473,6 +1482,7 @@ class _OffloadedModuleHandle:
             staged_parameters=staged_parameters,
             optimizer=optimizer,
             optimizer_device=optimizer_device,
+            async_commit=async_commit,
         )
 
         del optimizer, staged_parameters
@@ -1830,6 +1840,8 @@ class CPUStreamingEngine:
         self.process_group = process_group
         self.close_rank = int(close_rank)
         self.transfer_metrics = metrics
+        self.optimizer_prefetch_enabled = _env_flag("DTAI_PARALLEL_OPTIMIZER_PREFETCH", default=True)
+        self.optimizer_async_commit_enabled = _env_flag("DTAI_PARALLEL_OPTIMIZER_ASYNC_COMMIT", default=True)
         self._closed = False
 
         self.handles = list(streaming_container.offloaded_handles())
@@ -1952,7 +1964,7 @@ class CPUStreamingEngine:
             self.resident_optimizer.step()
             self.resident_optimizer.zero_grad(set_to_none=True)
 
-        if self.handles and self.local_device.type == "cuda":
+        if self.handles and self.local_device.type == "cuda" and self.optimizer_prefetch_enabled:
             self.handles[0].prefetch_optimizer_step(
                 optimizer_cls=self.optimizer_cls,
                 optimizer_kwargs=self.optimizer_kwargs,
@@ -1962,7 +1974,7 @@ class CPUStreamingEngine:
 
         for index, handle in enumerate(self.handles):
             next_index = index + 1
-            if next_index < len(self.handles) and self.local_device.type == "cuda":
+            if next_index < len(self.handles) and self.local_device.type == "cuda" and self.optimizer_prefetch_enabled:
                 self.handles[next_index].prefetch_optimizer_step(
                     optimizer_cls=self.optimizer_cls,
                     optimizer_kwargs=self.optimizer_kwargs,
@@ -1974,6 +1986,7 @@ class CPUStreamingEngine:
                 optimizer_kwargs=self.optimizer_kwargs,
                 optimizer_device=self.optimizer_device,
                 clip_coef=cuda_clip_coef,
+                async_commit=self.optimizer_async_commit_enabled,
             )
             if index > 0:
                 self.handles[index - 1].wait_optimizer_commit()
