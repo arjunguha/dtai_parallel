@@ -855,6 +855,14 @@ class _SharedCpuStore:
             shared.copy_(source.detach().to(device=torch.device("cpu")), non_blocking=False)
         return shared
 
+    def release_tensor(self, key: str) -> None:
+        self._storages.pop(key, None)
+        path = os.path.join(self.directory, self._safe_name(key))
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
     def cleanup(self) -> None:
         if not self.created_by_engine:
             return
@@ -1048,6 +1056,9 @@ class _OffloadedModuleHandle:
     def _shared_key(self, *parts: str) -> str:
         return ".".join((self.qualified_name, *parts))
 
+    def _local_gradient_key(self, name: str) -> str:
+        return self._shared_key("local_gradient", str(_rank(self.process_group)), name)
+
     def _copy_to_shared_gradient(self, name: str, source: Tensor, *, kind: str) -> Tensor:
         if self.shared_cpu_store is None:
             raise RuntimeError("shared gradient storage requested without a shared CPU store")
@@ -1061,6 +1072,32 @@ class _OffloadedModuleHandle:
         if self.metrics is None:
             return copy_fn()
         return self.metrics.record_copy(kind, byte_count, source.device, copy_fn)
+
+    def _copy_to_local_shared_gradient(self, name: str, source: Tensor, *, kind: str) -> Tensor:
+        if self.shared_cpu_store is None:
+            raise RuntimeError("local shared gradient storage requested without a shared CPU store")
+        shared = self.shared_cpu_store.tensor_like(self._local_gradient_key(name), source.detach())
+        byte_count = _tensor_nbytes(source)
+
+        def copy_fn() -> Tensor:
+            shared.copy_(source.detach(), non_blocking=False)
+            return shared
+
+        if self.metrics is None:
+            return copy_fn()
+        return self.metrics.record_copy(kind, byte_count, source.device, copy_fn)
+
+    def _release_shared_gradients(self, names: Iterable[str]) -> None:
+        if self.shared_cpu_store is None:
+            return
+        for name in names:
+            self.shared_cpu_store.release_tensor(self._shared_key("gradient", name))
+
+    def _release_local_shared_gradients(self, names: Iterable[str]) -> None:
+        if self.shared_cpu_store is None:
+            return
+        for name in names:
+            self.shared_cpu_store.release_tensor(self._local_gradient_key(name))
 
     def _share_module_cpu_state_(self) -> None:
         if self.shared_cpu_store is None:
@@ -1097,6 +1134,9 @@ class _OffloadedModuleHandle:
         self._wait_all_grad_copies()
         self._discard_pending_grad_copies()
         self._grad_norms_by_name = {}
+        if set_to_none:
+            self._release_shared_gradients(self.parameters_by_name.keys())
+            self._release_local_shared_gradients(self.parameters_by_name.keys())
         for parameter in self.parameters_by_name.values():
             if set_to_none:
                 parameter.grad = None
@@ -1460,8 +1500,11 @@ class _OffloadedModuleHandle:
                         )
                         accumulated.add_(grad_detached)
                     self._record_grad_norm(name, accumulated, norm_type=self.grad_norm_type)
-                    target.grad = _copy_tensor_to_cpu(accumulated, metrics=self.metrics, kind="grad_d2h", like=target)
-                    self._record_grad_copy(name, grad_detached.device)
+                    if self.uses_shared_cpu:
+                        target.grad = self._copy_to_local_shared_gradient(name, accumulated, kind="grad_d2h")
+                    else:
+                        target.grad = _copy_tensor_to_cpu(accumulated, metrics=self.metrics, kind="grad_d2h", like=target)
+                        self._record_grad_copy(name, grad_detached.device)
                 elif target.grad is None:
                     target.grad = grad.detach().clone()
                 else:
@@ -1517,6 +1560,7 @@ class _OffloadedModuleHandle:
                             parameter.grad = self._copy_to_shared_gradient(name, reduced, kind="grad_reduce_d2h")
                         else:
                             parameter.grad = None
+                        self._release_local_shared_gradients((name,))
                     else:
                         parameter.grad = _copy_tensor_to_cpu(reduced, metrics=self.metrics, kind="grad_reduce_d2h", like=parameter)
                         self._record_grad_copy(name, self.local_device)
@@ -1674,6 +1718,7 @@ class _OffloadedModuleHandle:
                     cpu_parameter.grad = None
                 if _distributed_is_active(self.process_group):
                     dist.barrier(group=self.process_group)
+                self._release_shared_gradients(name for name, _ in named_parameters)
                 return
 
             for name, cpu_parameter in named_parameters:
@@ -1726,6 +1771,7 @@ class _OffloadedModuleHandle:
                 cpu_parameter.grad = None
             if _distributed_is_active(self.process_group):
                 dist.barrier(group=self.process_group)
+            self._release_shared_gradients(name for name, _ in named_parameters)
             del optimizer, staged_parameters
             self.evict_device(optimizer_device)
             return

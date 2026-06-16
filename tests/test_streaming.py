@@ -709,6 +709,26 @@ def _shared_cpu_storage_worker(
             first_parameter.data.fill_(123.0)
         dist.barrier()
         observed = float(first_parameter.detach().flatten()[0].item())
+        criterion = nn.MSELoss()
+        engine.zero_grad(set_to_none=True)
+        x = torch.randn(4, 5, dtype=torch.float64)
+        y = torch.randn(4, 3, dtype=torch.float64)
+        loss = criterion(engine.model(x), y)
+        loss.backward()
+        engine.step()
+        dist.barrier()
+        gradient_paths = [
+            os.path.join(shared_dir, _SharedCpuStore._safe_name(handle._shared_key("gradient", name)))
+            for handle in engine.handles
+            for name in handle.param_names
+        ]
+        local_gradient_paths = [
+            os.path.join(shared_dir, _SharedCpuStore._safe_name(handle._local_gradient_key(name)))
+            for handle in engine.handles
+            for name in handle.param_names
+        ]
+        gradient_files_remaining = [path for path in gradient_paths if os.path.exists(path)]
+        local_gradient_files_remaining = [path for path in local_gradient_paths if os.path.exists(path)]
         torch.save(
             {
                 "rank": rank,
@@ -716,6 +736,8 @@ def _shared_cpu_storage_worker(
                 "shared_dir": shared_dir,
                 "is_shm": os.path.commonpath([os.path.realpath("/dev/shm"), os.path.realpath(shared_dir)])
                 == os.path.realpath("/dev/shm"),
+                "gradient_files_remaining": gradient_files_remaining,
+                "local_gradient_files_remaining": local_gradient_files_remaining,
             },
             f"{result_file}.{rank}",
         )
@@ -752,6 +774,8 @@ def test_distributed_offloaded_parameters_use_shared_cpu_storage() -> None:
     assert {result["rank"] for result in results} == {0, 1}
     assert all(result["observed"] == 123.0 for result in results)
     assert all(result["is_shm"] for result in results)
+    assert all(not result["gradient_files_remaining"] for result in results)
+    assert all(not result["local_gradient_files_remaining"] for result in results)
 
 
 def test_shared_cpu_dir_must_be_under_dev_shm(tmp_path: Path) -> None:
