@@ -1,7 +1,8 @@
 """Peak memory characterization for CPU-streamed CUDA training on Qwen2.5-Coder-14B.
 
-Uses the same measurement principles as ``test_streaming_memory.py``: CPU RSS from
-``/proc/self/status`` and CUDA peak from ``torch.cuda.max_memory_allocated()``.
+Uses the same measurement principles as ``test_streaming_memory.py``: CPU PSS
+from ``/proc/self/smaps_rollup`` and CUDA peak from
+``torch.cuda.max_memory_allocated()``.
 
 Sequence length is varied across 1k, 2k, 4k, and 8k tokens to show how activation
 memory affects the CUDA peak while CPU offload footprint stays fixed.  Step time is
@@ -88,12 +89,20 @@ def resolve_qwen_14b_model_path() -> Path | None:
     return None
 
 
-def read_rss_bytes() -> int:
+def read_cpu_pss_bytes() -> int:
+    try:
+        with open("/proc/self/smaps_rollup", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+
     with open("/proc/self/status", encoding="ascii") as handle:
         for line in handle:
             if line.startswith("VmRSS:"):
                 return int(line.split()[1]) * 1024
-    raise RuntimeError("VmRSS not found in /proc/self/status")
+    raise RuntimeError("neither Pss nor VmRSS memory accounting is available")
 
 
 def parameter_bytes(module: nn.Module) -> int:
@@ -134,7 +143,7 @@ def print_qwen_memory_table(rows: List[QwenMemoryRow]) -> None:
     columns: List[Tuple[str, int, str]] = [
         ("seq len", 8, "right"),
         ("CUDA peak (GiB)", 16, "right"),
-        ("CPU RSS (GiB)", 15, "right"),
+        ("CPU PSS (GiB)", 15, "right"),
         ("avg step (s)", 12, "right"),
     ]
 
@@ -165,7 +174,7 @@ def print_qwen_memory_table(rows: List[QwenMemoryRow]) -> None:
 class IterationMemoryTracker:
     def __init__(self, device: torch.device) -> None:
         self.device = device
-        self.cpu_rss_peak = 0
+        self.cpu_pss_peak = 0
         self.cuda_peak = 0
 
     def begin_iteration(self) -> None:
@@ -173,7 +182,7 @@ class IterationMemoryTracker:
             torch.cuda.reset_peak_memory_stats(self.device)
 
     def sample(self) -> None:
-        self.cpu_rss_peak = max(self.cpu_rss_peak, read_rss_bytes())
+        self.cpu_pss_peak = max(self.cpu_pss_peak, read_cpu_pss_bytes())
         if self.device.type == "cuda":
             self.cuda_peak = max(self.cuda_peak, int(torch.cuda.max_memory_allocated(self.device)))
 
@@ -252,7 +261,8 @@ def _qwen_memory_worker(
             step_seconds.append(time.perf_counter() - step_start)
             iteration_records.append(
                 {
-                    "cpu_rss_peak_bytes": tracker.cpu_rss_peak,
+                    "cpu_rss_peak_bytes": tracker.cpu_pss_peak,
+                    "cpu_pss_peak_bytes": tracker.cpu_pss_peak,
                     "cuda_peak_bytes": tracker.cuda_peak,
                     "step_seconds": step_seconds[-1],
                 }
@@ -337,7 +347,7 @@ def test_qwen14b_streaming_peak_memory(
     parameter_count = int(payload["parameter_count"])
     assert parameter_count >= 13_000_000_000
 
-    cpu_peak = max(int(record["cpu_rss_peak_bytes"]) for record in records)
+    cpu_peak = max(int(record.get("cpu_pss_peak_bytes", record["cpu_rss_peak_bytes"])) for record in records)
     cuda_peak = max(int(record["cuda_peak_bytes"]) for record in records)
     step_seconds = [float(value) for value in payload["step_seconds"]]
     assert len(step_seconds) == TRAIN_STEPS

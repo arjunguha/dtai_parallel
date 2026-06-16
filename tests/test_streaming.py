@@ -36,6 +36,7 @@ from dtai_parallel import (
     apply_cpu_streaming_,
     apply_cpu_streaming_to_modulelist_,
 )
+from dtai_parallel.streaming import _SharedCpuStore
 
 
 class ResidualBlock(nn.Module):
@@ -678,6 +679,98 @@ def _streaming_ddp_worker(
             torch.save({k: v.detach().cpu() for k, v in closed.state_dict().items()}, result_file)
     finally:
         dist.destroy_process_group()
+
+
+def _shared_cpu_storage_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    result_file: str,
+    initial_state: Mapping[str, Tensor],
+) -> None:
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size, init_method=f"file://{init_file}")
+    try:
+        model = SandwichModel(dtype=torch.float64)
+        model.load_state_dict(initial_state, strict=True)
+        engine = apply_cpu_streaming_(
+            model,
+            "layers",
+            offload_policy=True,
+            optimizer_cls=torch.optim.AdamW,
+            optimizer_kwargs=optimizer_kwargs_for("adamw"),
+            device=torch.device("cpu"),
+            auto_init_process_group=False,
+            wrap_ddp=False,
+        )
+        first_parameter = next(iter(engine.handles[0].parameters_by_name.values()))
+        shared_dir = engine.config.shared_cpu_dir
+        assert shared_dir is not None
+        if rank == 0:
+            first_parameter.data.fill_(123.0)
+        dist.barrier()
+        observed = float(first_parameter.detach().flatten()[0].item())
+        torch.save(
+            {
+                "rank": rank,
+                "observed": observed,
+                "shared_dir": shared_dir,
+                "is_shm": os.path.commonpath([os.path.realpath("/dev/shm"), os.path.realpath(shared_dir)])
+                == os.path.realpath("/dev/shm"),
+            },
+            f"{result_file}.{rank}",
+        )
+        engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_distributed_offloaded_parameters_use_shared_cpu_storage() -> None:
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    if not os.path.isdir("/dev/shm"):
+        pytest.skip("/dev/shm is unavailable")
+
+    world_size = 2
+    initial_model = SandwichModel(dtype=torch.float64)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        init_file = os.path.join(tmpdir, "shared_init")
+        result_file = os.path.join(tmpdir, "shared_result.pt")
+        if os.path.exists(init_file):
+            os.unlink(init_file)
+
+        mp.start_processes(
+            _shared_cpu_storage_worker,
+            args=(world_size, init_file, result_file, initial_model.state_dict()),
+            nprocs=world_size,
+            start_method="spawn",
+            join=True,
+        )
+
+        results = [torch.load(f"{result_file}.{rank}", map_location="cpu") for rank in range(world_size)]
+
+    assert {result["rank"] for result in results} == {0, 1}
+    assert all(result["observed"] == 123.0 for result in results)
+    assert all(result["is_shm"] for result in results)
+
+
+def test_shared_cpu_dir_must_be_under_dev_shm(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="shared_cpu_dir must be under"):
+        _SharedCpuStore._validate_shm_path(str(tmp_path))
+
+
+def test_shared_cpu_store_rejects_mismatched_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("dtai_parallel.streaming._world_size", lambda process_group=None: 2)
+    monkeypatch.setattr("dtai_parallel.streaming.socket.gethostname", lambda: "host-a")
+
+    def fake_all_gather_object(output, value, group=None):
+        del value, group
+        output[:] = ["host-a", "host-b"]
+
+    monkeypatch.setattr("dtai_parallel.streaming.dist.all_gather_object", fake_all_gather_object)
+
+    with pytest.raises(RuntimeError, match="same host"):
+        _SharedCpuStore._validate_same_host(None)
 
 
 @pytest.mark.parametrize("device_kind", ["cpu", "cuda"])

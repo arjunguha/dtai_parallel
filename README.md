@@ -14,11 +14,13 @@ The implementation assumes the common `torchrun` layout: one process owns one GP
 
 When a distributed process group is active and `wrap_ddp=True`, the engine wraps the transformed model in `torch.nn.parallel.DistributedDataParallel`.  This automatically handles resident parameters.  Offloaded parameters are hidden from the module tree, so DDP does not see them; the engine explicitly averages their gradients and dispatches their optimizer steps.
 
+Distributed offloaded CPU state assumes all ranks are on the same host.  In that case, offloaded CPU master weights, reduced gradients, and optimizer-state tensor storage are mandatory file-backed shared memory under `/dev/shm`.  If ranks report different hostnames, or a configured shared-memory directory does not resolve under `/dev/shm`, initialization fails.  Single-process training keeps the ordinary in-process CPU-master path.
+
 ## What is streamed
 
 For an offloaded stage, the CPU master module owns the true parameters and buffers.  Forward prefetches the stage's parameter and buffer state to the local device, calls the layer with the user's original `*args` and `**kwargs`, saves activations, and drops the temporary streamed state.  Backward replays the same layer under autograd with streamed parameter copies that require gradients, accumulates local parameter gradients into the CPU master, and then `engine.step()` averages them across ranks.
 
-The optimizer path does not implement AdamW or SGD equations.  For each offloaded stage, the engine constructs the requested PyTorch optimizer class on temporary device parameters, restores that stage's opaque optimizer state, calls `optimizer.step()`, and writes the updated weights and optimizer state back to CPU.  Optimizer state for offloaded layers is sharded by stage owner rank.  Resident parameters use one ordinary PyTorch optimizer attached to DDP-visible parameters.
+The optimizer path does not implement AdamW or SGD equations.  For each offloaded stage, the engine constructs the requested PyTorch optimizer class on temporary device parameters, restores that stage's opaque optimizer state, calls `optimizer.step()`, and writes the updated weights and optimizer state back to CPU.  In distributed runs, each stage owner performs the optimizer step and writes tensor leaves into shared CPU storage; Python optimizer metadata remains local to the owner rank.  Resident parameters use one ordinary PyTorch optimizer attached to DDP-visible parameters.
 
 Asynchronous prefetching is implemented for CUDA with side streams and events.  During forward, a stage schedules the next offloaded stage.  During backward, a stage schedules the previous offloaded stage.  On CPU the same interface is used, but prefetching is necessarily synchronous.
 
@@ -116,4 +118,6 @@ Run the suite with:
 PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
 ```
 
-In this CPU-only environment the CUDA cases skip automatically.  The suite includes single-process equivalence tests, mixed resident/offloaded tests, nested `decoder.layers` transformation tests, arbitrary `*args`/`**kwargs` and nested-output tests, prefetch-scheduling tests, and a real two-process DDP equivalence check using Gloo on CPU or NCCL on CUDA.
+In this CPU-only environment the CUDA cases skip automatically.  The suite includes single-process equivalence tests, mixed resident/offloaded tests, nested `decoder.layers` transformation tests, arbitrary `*args`/`**kwargs` and nested-output tests, prefetch-scheduling tests, shared `/dev/shm` storage tests, and a real two-process DDP equivalence check using Gloo on CPU or NCCL on CUDA.
+
+For distributed memory studies, prefer proportional set size from `/proc/self/smaps_rollup`; RSS counts shared pages in every rank and will overstate the physical CPU footprint of shared offloaded state.
