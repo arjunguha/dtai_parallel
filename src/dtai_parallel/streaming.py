@@ -249,6 +249,36 @@ class _Tree:
             return tuple(_Tree.detach_cpu(v, metrics=metrics, kind=kind, pin_memory=pin_memory) for v in value)
         return copy.deepcopy(value)
 
+    @staticmethod
+    def record_stream(value: Any, stream: torch.cuda.Stream) -> None:
+        if torch.is_tensor(value):
+            if value.device.type == "cuda":
+                value.record_stream(stream)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                _Tree.record_stream(item, stream)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                _Tree.record_stream(item, stream)
+
+    @staticmethod
+    def detach_pageable_cpu(value: Any) -> Any:
+        if torch.is_tensor(value):
+            if value.device.type != "cpu":
+                raise ValueError("detach_pageable_cpu expects CPU tensors")
+            out = _empty_cpu_like(value, pin_memory=False)
+            out.copy_(value, non_blocking=False)
+            return out
+        if isinstance(value, dict):
+            return {k: _Tree.detach_pageable_cpu(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_Tree.detach_pageable_cpu(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(_Tree.detach_pageable_cpu(v) for v in value)
+        return copy.deepcopy(value)
+
 
 def _tensor_nbytes(tensor: Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
@@ -781,6 +811,22 @@ class _PendingGradCopy:
     event: Optional[torch.cuda.Event]
 
 
+@dataclass
+class _PrefetchedOptimizerStep:
+    named_parameters: List[Tuple[str, nn.Parameter]]
+    staged_parameters: List[nn.Parameter]
+    optimizer: Optional[torch.optim.Optimizer]
+    event: Optional[torch.cuda.Event]
+
+
+@dataclass
+class _PendingOptimizerCommit:
+    parameter_copies: List[Tuple[nn.Parameter, Tensor]]
+    optimizer_state: Optional[Dict[str, Dict[str, Any]]]
+    device_refs: List[Any]
+    event: Optional[torch.cuda.Event]
+
+
 class _OffloadedModuleHandle:
     """Hidden CPU master state for one streamed layer.
 
@@ -829,6 +875,10 @@ class _OffloadedModuleHandle:
         self._lock = threading.Lock()
         self._prefetched: Optional[_PrefetchedState] = None
         self._prefetch_streams: Dict[Tuple[int, bool], torch.cuda.Stream] = {}
+        self._optimizer_prefetch_streams: Dict[int, torch.cuda.Stream] = {}
+        self._optimizer_commit_streams: Dict[int, torch.cuda.Stream] = {}
+        self._prefetched_optimizer_step: Optional[_PrefetchedOptimizerStep] = None
+        self._pending_optimizer_commit: Optional[_PendingOptimizerCommit] = None
         self._pending_grad_copies: Dict[str, List[_PendingGradCopy]] = {}
         self._grad_copy_events: Dict[str, torch.cuda.Event] = {}
         self._grad_norms_by_name: Dict[str, Tensor] = {}
@@ -845,6 +895,7 @@ class _OffloadedModuleHandle:
         self.module.train(mode)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        self.wait_optimizer_commit()
         self._wait_all_grad_copies()
         self._discard_pending_grad_copies()
         self._grad_norms_by_name = {}
@@ -927,6 +978,26 @@ class _OffloadedModuleHandle:
             self._prefetch_streams[key] = stream
         return stream
 
+    def _optimizer_prefetch_stream(self, device: torch.device) -> torch.cuda.Stream:
+        index = device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        stream = self._optimizer_prefetch_streams.get(int(index))
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._optimizer_prefetch_streams[int(index)] = stream
+        return stream
+
+    def _optimizer_commit_stream(self, device: torch.device) -> torch.cuda.Stream:
+        index = device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        stream = self._optimizer_commit_streams.get(int(index))
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            self._optimizer_commit_streams[int(index)] = stream
+        return stream
+
     def clear_prefetch(self) -> None:
         with self._lock:
             self._prefetched = None
@@ -971,6 +1042,180 @@ class _OffloadedModuleHandle:
         if prefetched is not None:
             return prefetched.wait()
         return self._state_for_call(device, requires_grad)
+
+    def prefetch_optimizer_step(
+        self,
+        *,
+        optimizer_cls: Type[torch.optim.Optimizer],
+        optimizer_kwargs: Mapping[str, Any],
+        optimizer_device: torch.device,
+        clip_coef: Optional[Tensor],
+    ) -> None:
+        """Stage this layer's optimizer inputs to the optimizer device on a side stream."""
+
+        self.wait_optimizer_commit()
+        self.clear_prefetch()
+        if self.local_device.type != "cuda":
+            return
+
+        named_parameters = list(self.parameters_by_name.items())
+        if not named_parameters:
+            return
+
+        rank = _rank(self.process_group)
+        if rank != self.owner_rank:
+            return
+
+        stream = self._optimizer_prefetch_stream(optimizer_device)
+        staged_parameters: List[nn.Parameter] = []
+        with torch.cuda.stream(stream):
+            for name, cpu_parameter in named_parameters:
+                staged = nn.Parameter(
+                    _copy_tensor_to_device(
+                        cpu_parameter.detach(),
+                        optimizer_device,
+                        metrics=self.metrics,
+                        kind="optimizer_param_h2d",
+                        pin_source=self.lazy_pin_cpu_transfers,
+                        pinned_transfer_buffer=self.pinned_transfer_buffer,
+                    ),
+                    requires_grad=cpu_parameter.requires_grad,
+                )
+                if cpu_parameter.grad is not None:
+                    self._wait_grad_copy(name)
+                    staged.grad = _copy_tensor_to_device(
+                        cpu_parameter.grad.detach(),
+                        optimizer_device,
+                        metrics=self.metrics,
+                        kind="optimizer_grad_h2d",
+                        pin_source=self.lazy_pin_cpu_transfers,
+                        pinned_transfer_buffer=self.pinned_transfer_buffer,
+                    )
+                    if clip_coef is not None:
+                        staged.grad.mul_(clip_coef.to(staged.grad.device))
+                staged_parameters.append(staged)
+
+            optimizer = optimizer_cls(staged_parameters, **dict(optimizer_kwargs))
+            for (name, _), staged in zip(named_parameters, staged_parameters):
+                saved_state = self.optimizer_state.get(name)
+                if saved_state is not None:
+                    optimizer.state[staged] = _Tree.to_device(
+                        saved_state,
+                        optimizer_device,
+                        metrics=self.metrics,
+                        pin_source=self.lazy_pin_cpu_transfers,
+                        pinned_transfer_buffer=self.pinned_transfer_buffer,
+                    )
+            event = torch.cuda.Event()
+            event.record(stream)
+
+        with self._lock:
+            self._prefetched_optimizer_step = _PrefetchedOptimizerStep(
+                named_parameters=named_parameters,
+                staged_parameters=staged_parameters,
+                optimizer=optimizer,
+                event=event,
+            )
+
+    def _consume_optimizer_step(
+        self,
+        *,
+        optimizer_cls: Type[torch.optim.Optimizer],
+        optimizer_kwargs: Mapping[str, Any],
+        optimizer_device: torch.device,
+        clip_coef: Optional[Tensor],
+    ) -> _PrefetchedOptimizerStep:
+        with self._lock:
+            prefetched = self._prefetched_optimizer_step
+            self._prefetched_optimizer_step = None
+
+        if prefetched is None:
+            self.prefetch_optimizer_step(
+                optimizer_cls=optimizer_cls,
+                optimizer_kwargs=optimizer_kwargs,
+                optimizer_device=optimizer_device,
+                clip_coef=clip_coef,
+            )
+            with self._lock:
+                prefetched = self._prefetched_optimizer_step
+                self._prefetched_optimizer_step = None
+            if prefetched is None:
+                raise RuntimeError("failed to prefetch optimizer step")
+
+        if prefetched.event is not None:
+            current = torch.cuda.current_stream(optimizer_device)
+            current.wait_event(prefetched.event)
+            for staged in prefetched.staged_parameters:
+                staged.data.record_stream(current)
+                if staged.grad is not None:
+                    staged.grad.record_stream(current)
+            if prefetched.optimizer is not None:
+                for state in prefetched.optimizer.state.values():
+                    _Tree.record_stream(state, current)
+        return prefetched
+
+    def _schedule_optimizer_commit(
+        self,
+        *,
+        named_parameters: List[Tuple[str, nn.Parameter]],
+        staged_parameters: List[nn.Parameter],
+        optimizer: Optional[torch.optim.Optimizer],
+        optimizer_device: torch.device,
+    ) -> None:
+        if optimizer_device.type != "cuda":
+            for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
+                cpu_parameter.data.copy_(staged.detach(), non_blocking=False)
+                if optimizer is not None and staged in optimizer.state:
+                    self.optimizer_state[name] = _Tree.detach_cpu(
+                        optimizer.state[staged],
+                        metrics=self.metrics,
+                        pin_memory=False,
+                    )
+            return
+
+        stream = self._optimizer_commit_stream(optimizer_device)
+        stream.wait_stream(torch.cuda.current_stream(optimizer_device))
+        parameter_copies: List[Tuple[nn.Parameter, Tensor]] = []
+        optimizer_state: Dict[str, Dict[str, Any]] = {}
+        with torch.cuda.stream(stream):
+            for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
+                copied = _copy_tensor_to_cpu(
+                    staged.detach(),
+                    metrics=self.metrics,
+                    kind="optimizer_param_d2h",
+                    pin_memory=True,
+                )
+                parameter_copies.append((cpu_parameter, copied))
+                if optimizer is not None and staged in optimizer.state:
+                    optimizer_state[name] = _Tree.detach_cpu(
+                        optimizer.state[staged],
+                        metrics=self.metrics,
+                        pin_memory=True,
+                    )
+            event = torch.cuda.Event()
+            event.record(stream)
+
+        with self._lock:
+            self._pending_optimizer_commit = _PendingOptimizerCommit(
+                parameter_copies=parameter_copies,
+                optimizer_state=optimizer_state,
+                device_refs=[staged_parameters, optimizer],
+                event=event,
+            )
+
+    def wait_optimizer_commit(self) -> None:
+        with self._lock:
+            pending = self._pending_optimizer_commit
+            self._pending_optimizer_commit = None
+        if pending is None:
+            return
+        if pending.event is not None:
+            pending.event.synchronize()
+        for cpu_parameter, copied in pending.parameter_copies:
+            cpu_parameter.data = _Tree.detach_pageable_cpu(copied)
+        if pending.optimizer_state is not None:
+            self.optimizer_state = _Tree.detach_pageable_cpu(pending.optimizer_state)
+        pending.device_refs.clear()
 
     def forward_on_device(self, args: Tuple[Any, ...], kwargs: Mapping[str, Any], device: torch.device) -> Any:
         state = self._consume_state(device=device, requires_grad=False)
@@ -1136,79 +1381,105 @@ class _OffloadedModuleHandle:
         if not named_parameters:
             return
 
+        if self.local_device.type != "cuda":
+            rank = _rank(self.process_group)
+            owner = self.owner_rank
+            if rank == owner:
+                staged_parameters: List[nn.Parameter] = []
+                for name, cpu_parameter in named_parameters:
+                    staged = nn.Parameter(
+                        _copy_tensor_to_device(
+                            cpu_parameter.detach(),
+                            optimizer_device,
+                            metrics=self.metrics,
+                            kind="optimizer_param_h2d",
+                            pin_source=self.lazy_pin_cpu_transfers,
+                            pinned_transfer_buffer=self.pinned_transfer_buffer,
+                        ),
+                        requires_grad=cpu_parameter.requires_grad,
+                    )
+                    if cpu_parameter.grad is not None:
+                        staged.grad = _copy_tensor_to_device(
+                            cpu_parameter.grad.detach(),
+                            optimizer_device,
+                            metrics=self.metrics,
+                            kind="optimizer_grad_h2d",
+                            pin_source=self.lazy_pin_cpu_transfers,
+                            pinned_transfer_buffer=self.pinned_transfer_buffer,
+                        )
+                    staged_parameters.append(staged)
+
+                optimizer = optimizer_cls(staged_parameters, **dict(optimizer_kwargs))
+                for (name, _), staged in zip(named_parameters, staged_parameters):
+                    saved_state = self.optimizer_state.get(name)
+                    if saved_state is not None:
+                        optimizer.state[staged] = _Tree.to_device(
+                            saved_state,
+                            optimizer_device,
+                            metrics=self.metrics,
+                            pin_source=self.lazy_pin_cpu_transfers,
+                            pinned_transfer_buffer=self.pinned_transfer_buffer,
+                        )
+                optimizer.step()
+                for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
+                    cpu_parameter.data.copy_(staged.detach(), non_blocking=False)
+                    if staged in optimizer.state:
+                        self.optimizer_state[name] = _Tree.detach_cpu(
+                            optimizer.state[staged],
+                            metrics=self.metrics,
+                            pin_memory=False,
+                        )
+
+            for name, cpu_parameter in named_parameters:
+                _broadcast_tensor_(cpu_parameter.data, src=owner, local_device=self.local_device, process_group=self.process_group)
+                cpu_parameter.grad = None
+            return
+
         rank = _rank(self.process_group)
         owner = self.owner_rank
+        staged_parameters: List[nn.Parameter]
+        optimizer: Optional[torch.optim.Optimizer]
         if rank == owner:
-            staged_parameters: List[nn.Parameter] = []
-            for name, cpu_parameter in named_parameters:
-                staged = nn.Parameter(
-                    _copy_tensor_to_device(
-                        cpu_parameter.detach(),
-                        optimizer_device,
-                        metrics=self.metrics,
-                        kind="optimizer_param_h2d",
-                        pin_source=self.lazy_pin_cpu_transfers,
-                        pinned_transfer_buffer=self.pinned_transfer_buffer,
-                    ),
-                    requires_grad=cpu_parameter.requires_grad,
-                )
-                if cpu_parameter.grad is not None:
-                    self._wait_grad_copy(name)
-                    staged.grad = _copy_tensor_to_device(
-                        cpu_parameter.grad.detach(),
-                        optimizer_device,
-                        metrics=self.metrics,
-                        kind="optimizer_grad_h2d",
-                        pin_source=self.lazy_pin_cpu_transfers,
-                        pinned_transfer_buffer=self.pinned_transfer_buffer,
-                    )
-                    if clip_coef is not None:
-                        staged.grad.mul_(clip_coef.to(staged.grad.device))
-                staged_parameters.append(staged)
-
-            optimizer = optimizer_cls(staged_parameters, **dict(optimizer_kwargs))
-            for (name, _), staged in zip(named_parameters, staged_parameters):
-                saved_state = self.optimizer_state.get(name)
-                if saved_state is not None:
-                    optimizer.state[staged] = _Tree.to_device(
-                        saved_state,
-                        optimizer_device,
-                        metrics=self.metrics,
-                        pin_source=self.lazy_pin_cpu_transfers,
-                        pinned_transfer_buffer=self.pinned_transfer_buffer,
-                    )
+            prefetched = self._consume_optimizer_step(
+                optimizer_cls=optimizer_cls,
+                optimizer_kwargs=optimizer_kwargs,
+                optimizer_device=optimizer_device,
+                clip_coef=clip_coef,
+            )
+            named_parameters = prefetched.named_parameters
+            staged_parameters = prefetched.staged_parameters
+            optimizer = prefetched.optimizer
+            if optimizer is None:
+                raise RuntimeError("owner rank is missing prefetched optimizer")
 
             optimizer.step()
-
-            for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
-                staged_detached = staged.detach()
-                self.metrics.record_copy(
-                    "optimizer_param_d2h",
-                    _tensor_nbytes(staged_detached),
-                    optimizer_device,
-                    lambda staged_detached=staged_detached, cpu_parameter=cpu_parameter: cpu_parameter.data.copy_(
-                        staged_detached, non_blocking=True
-                    ),
+        else:
+            staged_parameters = [
+                nn.Parameter(
+                    torch.empty_like(cpu_parameter, device=self.local_device),
+                    requires_grad=cpu_parameter.requires_grad,
                 )
-                if staged in optimizer.state:
-                    self.optimizer_state[name] = _Tree.detach_cpu(
-                        optimizer.state[staged],
-                        metrics=self.metrics,
-                        pin_memory=False,
-                    )
+                for _, cpu_parameter in named_parameters
+            ]
+            optimizer = None
 
-            if optimizer_device.type == "cuda":
-                torch.cuda.current_stream(optimizer_device).synchronize()
-
-            del optimizer, staged_parameters
-            self.evict_device(optimizer_device)
-
-        for name, cpu_parameter in named_parameters:
+        for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
             self._wait_grad_copy(name)
-            _broadcast_tensor_(cpu_parameter.data, src=owner, local_device=self.local_device, process_group=self.process_group)
+            _broadcast_tensor_(staged.data, src=owner, local_device=self.local_device, process_group=self.process_group)
             cpu_parameter.grad = None
 
+        self._schedule_optimizer_commit(
+            named_parameters=named_parameters,
+            staged_parameters=staged_parameters,
+            optimizer=optimizer,
+            optimizer_device=optimizer_device,
+        )
+
+        del optimizer, staged_parameters
+        self.evict_device(optimizer_device)
+
     def materialize(self, device: torch.device) -> nn.Module:
+        self.wait_optimizer_commit()
         return copy.deepcopy(self.module).to(device)
 
 
@@ -1681,13 +1952,34 @@ class CPUStreamingEngine:
             self.resident_optimizer.step()
             self.resident_optimizer.zero_grad(set_to_none=True)
 
-        for handle in self.handles:
+        if self.handles and self.local_device.type == "cuda":
+            self.handles[0].prefetch_optimizer_step(
+                optimizer_cls=self.optimizer_cls,
+                optimizer_kwargs=self.optimizer_kwargs,
+                optimizer_device=self.optimizer_device,
+                clip_coef=cuda_clip_coef,
+            )
+
+        for index, handle in enumerate(self.handles):
+            next_index = index + 1
+            if next_index < len(self.handles) and self.local_device.type == "cuda":
+                self.handles[next_index].prefetch_optimizer_step(
+                    optimizer_cls=self.optimizer_cls,
+                    optimizer_kwargs=self.optimizer_kwargs,
+                    optimizer_device=self.optimizer_device,
+                    clip_coef=cuda_clip_coef,
+                )
             handle.optimizer_step(
                 optimizer_cls=self.optimizer_cls,
                 optimizer_kwargs=self.optimizer_kwargs,
                 optimizer_device=self.optimizer_device,
                 clip_coef=cuda_clip_coef,
             )
+            if index > 0:
+                self.handles[index - 1].wait_optimizer_commit()
+
+        if self.handles:
+            self.handles[-1].wait_optimizer_commit()
 
         self.streaming_container.clear_prefetch()
         return total_norm
