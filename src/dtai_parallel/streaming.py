@@ -334,6 +334,22 @@ class _Tree:
             return tuple(_Tree.detach_pageable_cpu(v) for v in value)
         return copy.deepcopy(value)
 
+    @staticmethod
+    def copy_to_shared_cpu(value: Any, shared_cpu_store: "_SharedCpuStore", shared_key: str) -> Any:
+        if torch.is_tensor(value):
+            shared = shared_cpu_store.tensor_like(shared_key, value.detach())
+            shared.copy_(value.detach(), non_blocking=False)
+            return shared
+        if isinstance(value, dict):
+            return {k: _Tree.copy_to_shared_cpu(v, shared_cpu_store, f"{shared_key}.{k}") for k, v in value.items()}
+        if isinstance(value, list):
+            return [_Tree.copy_to_shared_cpu(v, shared_cpu_store, f"{shared_key}.{index}") for index, v in enumerate(value)]
+        if isinstance(value, tuple):
+            return tuple(
+                _Tree.copy_to_shared_cpu(v, shared_cpu_store, f"{shared_key}.{index}") for index, v in enumerate(value)
+            )
+        return copy.deepcopy(value)
+
 
 def _tensor_nbytes(tensor: Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
@@ -979,6 +995,9 @@ class _PendingOptimizerCommit:
     optimizer_state: Optional[Dict[str, Dict[str, Any]]]
     device_refs: List[Any]
     event: Optional[torch.cuda.Event]
+    worker: Optional[threading.Thread] = None
+    worker_error: Optional[BaseException] = None
+    completed: bool = False
 
 
 class _OffloadedModuleHandle:
@@ -1392,19 +1411,53 @@ class _OffloadedModuleHandle:
                         optimizer.state[staged],
                         metrics=self.metrics,
                         pin_memory=True,
-                        shared_cpu_store=self.shared_cpu_store,
-                        shared_key=self._shared_key("optimizer", name),
                     )
             event = torch.cuda.Event()
             event.record(stream)
 
-        with self._lock:
-            self._pending_optimizer_commit = _PendingOptimizerCommit(
-                parameter_copies=parameter_copies,
-                optimizer_state=optimizer_state,
-                device_refs=[staged_parameters, optimizer],
-                event=event,
+        pending = _PendingOptimizerCommit(
+            parameter_copies=parameter_copies,
+            optimizer_state=optimizer_state,
+            device_refs=[staged_parameters, optimizer],
+            event=event,
+        )
+        if self.shared_cpu_store is not None:
+            pending.worker = threading.Thread(
+                target=self._finish_pending_optimizer_commit_worker,
+                args=(pending,),
+                name=f"dtai-parallel-optimizer-commit-{self.display_name}",
             )
+            pending.worker.start()
+
+        with self._lock:
+            self._pending_optimizer_commit = pending
+
+    def _finish_pending_optimizer_commit_worker(self, pending: _PendingOptimizerCommit) -> None:
+        try:
+            if pending.event is not None:
+                pending.event.synchronize()
+            self._finish_pending_optimizer_commit(pending)
+        except BaseException as exc:
+            pending.worker_error = exc
+
+    def _finish_pending_optimizer_commit(self, pending: _PendingOptimizerCommit) -> None:
+        if pending.completed:
+            return
+        for cpu_parameter, copied in pending.parameter_copies:
+            if self.shared_cpu_store is not None:
+                cpu_parameter.data.copy_(copied, non_blocking=False)
+            else:
+                cpu_parameter.data = _Tree.detach_pageable_cpu(copied)
+        if pending.optimizer_state is not None:
+            if self.shared_cpu_store is not None:
+                self.optimizer_state = {
+                    name: _Tree.copy_to_shared_cpu(state, self.shared_cpu_store, self._shared_key("optimizer", name))
+                    for name, state in pending.optimizer_state.items()
+                }
+            else:
+                self.optimizer_state = _Tree.detach_pageable_cpu(pending.optimizer_state)
+        pending.device_refs.clear()
+        pending.completed = True
 
     def wait_optimizer_commit(self) -> None:
         with self._lock:
@@ -1412,13 +1465,14 @@ class _OffloadedModuleHandle:
             self._pending_optimizer_commit = None
         if pending is None:
             return
+        if pending.worker is not None:
+            pending.worker.join()
+            if pending.worker_error is not None:
+                raise RuntimeError("asynchronous optimizer commit failed") from pending.worker_error
+            return
         if pending.event is not None:
             pending.event.synchronize()
-        for cpu_parameter, copied in pending.parameter_copies:
-            cpu_parameter.data = _Tree.detach_pageable_cpu(copied)
-        if pending.optimizer_state is not None:
-            self.optimizer_state = _Tree.detach_pageable_cpu(pending.optimizer_state)
-        pending.device_refs.clear()
+        self._finish_pending_optimizer_commit(pending)
 
     def forward_on_device(self, args: Tuple[Any, ...], kwargs: Mapping[str, Any], device: torch.device) -> Any:
         state = self._consume_state(device=device, requires_grad=False)
@@ -1719,7 +1773,7 @@ class _OffloadedModuleHandle:
                     staged_parameters=staged_parameters,
                     optimizer=optimizer,
                     optimizer_device=optimizer_device,
-                    async_commit=False,
+                    async_commit=async_commit,
                 )
             for name, cpu_parameter in named_parameters:
                 self._wait_grad_copy(name)
