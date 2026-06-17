@@ -3,8 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from types import MethodType
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Mapping, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -12,12 +11,10 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 
-from dtai_parallel import CPUStreamingModuleList, CPUStreamingSequential, apply_cpu_streaming_, apply_cpu_streaming_to_modulelist_
+from dtai_parallel import CPUStreamingModuleList, apply_cpu_streaming_
 from dtai_parallel.streaming import _SharedCpuStore
 from tests.models import KwargSandwichModel, SandwichModel, SequentialSandwich
 from tests.support.training import (
-    assert_state_dicts_close,
-    assert_state_dicts_equal,
     make_batches,
     make_kwarg_batches,
     optimizer_cls_for,
@@ -61,39 +58,6 @@ def _destroy_distributed_if_needed() -> None:
     """Tear down the process group when a worker case initialized it."""
     if dist.is_initialized():
         dist.destroy_process_group()
-
-
-def _reference_ddp_state(
-    initial_state: Mapping[str, Tensor],
-    xs_cpu: Sequence[Tensor],
-    ys_cpu: Sequence[Tensor],
-    *,
-    max_grad_norm: Optional[float],
-    steps: int,
-) -> Mapping[str, Tensor] | None:
-    """Train the ordinary DDP reference and return its rank-zero state."""
-    _init_distributed_if_needed()
-    try:
-        device = _device()
-        rank = _rank()
-        model = SandwichModel(dtype=torch.float32).to(device)
-        model.load_state_dict(initial_state, strict=True)
-        ddp = DDP(model, device_ids=[device.index])
-        optimizer = torch.optim.AdamW(ddp.parameters(), **optimizer_kwargs_for("adamw"))
-        criterion = nn.MSELoss()
-        for _ in range(steps):
-            optimizer.zero_grad(set_to_none=True)
-            loss = criterion(ddp(xs_cpu[rank].to(device)), ys_cpu[rank].to(device))
-            loss.backward()
-            if max_grad_norm is not None:
-                clip_grad_norm_(ddp.parameters(), max_grad_norm, foreach=False)
-            optimizer.step()
-        dist.barrier()
-        if rank == 0:
-            return {key: value.detach().cpu() for key, value in model.state_dict().items()}
-        return None
-    finally:
-        _destroy_distributed_if_needed()
 
 
 def _streaming_ddp_state(
@@ -164,86 +128,6 @@ def _standard_state(
     return {key: value.detach().cpu() for key, value in model.state_dict().items()}
 
 
-def run_ddp_vs_ddp(result_file: Path) -> None:
-    """Run the legacy in-worker DDP comparison entry point."""
-    dtype = torch.float32
-    initial_model = SandwichModel(dtype=dtype)
-    xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
-    payload_file = result_file.with_suffix(".input.pt")
-    if _rank() == 0:
-        torch.save(
-            {
-                "initial_state": initial_model.state_dict(),
-                "xs_cpu": xs_cpu,
-                "ys_cpu": ys_cpu,
-            },
-            payload_file,
-        )
-    _init_distributed_if_needed()
-    dist.barrier()
-    _destroy_distributed_if_needed()
-    payload = torch.load(payload_file, map_location="cpu")
-
-    stream_state = _streaming_ddp_state(
-        payload["initial_state"],
-        payload["xs_cpu"],
-        payload["ys_cpu"],
-        max_grad_norm=0.5,
-        steps=2,
-    )
-    ref_state = _reference_ddp_state(
-        payload["initial_state"],
-        payload["xs_cpu"],
-        payload["ys_cpu"],
-        max_grad_norm=0.5,
-        steps=2,
-    )
-    if _rank() == 0:
-        assert stream_state is not None and ref_state is not None
-        assert_state_dicts_close(stream_state, ref_state, dtype=dtype)
-        torch.save({"ok": True}, result_file)
-
-
-def run_ddp_vs_standard(result_file: Path) -> None:
-    """Run the legacy in-worker streamed-versus-standard comparison entry point."""
-    dtype = torch.float32
-    initial_model = SandwichModel(dtype=dtype)
-    xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
-    payload_file = result_file.with_suffix(".input.pt")
-    if _rank() == 0:
-        torch.save(
-            {
-                "initial_state": initial_model.state_dict(),
-                "xs_cpu": xs_cpu,
-                "ys_cpu": ys_cpu,
-            },
-            payload_file,
-        )
-    _init_distributed_if_needed()
-    dist.barrier()
-    _destroy_distributed_if_needed()
-    payload = torch.load(payload_file, map_location="cpu")
-
-    stream_state = _streaming_ddp_state(
-        payload["initial_state"],
-        payload["xs_cpu"],
-        payload["ys_cpu"],
-        max_grad_norm=0.5,
-        steps=2,
-    )
-    if _rank() == 0:
-        ref_state = _standard_state(
-            payload["initial_state"],
-            payload["xs_cpu"],
-            payload["ys_cpu"],
-            max_grad_norm=0.5,
-            steps=2,
-        )
-        assert stream_state is not None
-        assert_state_dicts_close(stream_state, ref_state, dtype=dtype)
-        torch.save({"ok": True}, result_file)
-
-
 def _deterministic_inputs() -> tuple[Mapping[str, Tensor], Sequence[Tensor], Sequence[Tensor]]:
     """Create identical initial model state and batches for separate torchrun jobs."""
     dtype = torch.float32
@@ -251,15 +135,6 @@ def _deterministic_inputs() -> tuple[Mapping[str, Tensor], Sequence[Tensor], Seq
     initial_model = SandwichModel(dtype=dtype)
     xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
     return initial_model.state_dict(), xs_cpu, ys_cpu
-
-
-def run_reference_ddp_state(result_file: Path) -> None:
-    """Write the ordinary DDP reference state for pytest-side comparison."""
-    initial_state, xs_cpu, ys_cpu = _deterministic_inputs()
-    state = _reference_ddp_state(initial_state, xs_cpu, ys_cpu, max_grad_norm=0.5, steps=2)
-    if _rank() == 0:
-        assert state is not None
-        torch.save(state, result_file)
 
 
 def run_streaming_ddp_state(result_file: Path) -> None:
@@ -280,124 +155,134 @@ def run_standard_state(result_file: Path) -> None:
     torch.save(state, result_file)
 
 
-def run_single_gpu_reference(result_file: Path, pin_cpu_masters: str) -> None:
-    """Run the fixed one-GPU streaming equivalence case for a pinning mode."""
-    if _rank() != 0:
-        return
-    dtype = torch.float32
-    device = _device()
-    initial_model = SandwichModel(dtype=dtype)
-    xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
-    optimizer_kwargs = optimizer_kwargs_for("adamw")
-    reference = train_single_process_reference(
-        initial_model,
-        xs_cpu,
-        ys_cpu,
-        optimizer_name="adamw",
-        optimizer_kwargs=optimizer_kwargs,
-        max_grad_norm=0.5,
-        steps=2,
-        device=device,
-    )
-    streaming = train_single_process_streaming(
-        initial_model,
-        "layers",
-        xs_cpu,
-        ys_cpu,
-        offload_policy=[True, False, True],
-        optimizer_name="adamw",
-        optimizer_kwargs=optimizer_kwargs,
-        max_grad_norm=0.5,
-        steps=2,
-        device=device,
-        pin_cpu_masters=False if pin_cpu_masters == "false" else pin_cpu_masters,
-    )
-    assert_state_dicts_close(streaming.state_dict(), reference.state_dict(), dtype=dtype)
-    torch.save({"ok": True}, result_file)
-
-
-def run_single_gpu_equivalence(
+def run_single_gpu_reference_state(
     result_file: Path,
     *,
     container_kind: str,
     optimizer_name: str,
     max_grad_norm: Optional[float],
 ) -> None:
-    """Compare streamed and ordinary training for a parametrized one-GPU case."""
+    """Write ordinary one-GPU training state for pytest-side comparison."""
     if _rank() != 0:
         return
     dtype = torch.float32
     device = _device()
-    if container_kind == "modulelist":
-        initial_model: nn.Module = SandwichModel(dtype=dtype)
-        module_path = "layers"
-    else:
-        initial_model = SequentialSandwich(dtype=dtype)
-        module_path = "blocks"
-
+    torch.manual_seed(20260610)
+    initial_model, module_path = _single_gpu_model_and_path(container_kind, dtype)
+    del module_path
     xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
-    optimizer_kwargs = optimizer_kwargs_for(optimizer_name)
-    reference = train_single_process_reference(
+    state = train_single_process_reference(
         initial_model,
         xs_cpu,
         ys_cpu,
         optimizer_name=optimizer_name,
-        optimizer_kwargs=optimizer_kwargs,
+        optimizer_kwargs=optimizer_kwargs_for(optimizer_name),
         max_grad_norm=max_grad_norm,
         steps=2,
         device=device,
-    )
-    streaming = train_single_process_streaming(
+    ).state_dict()
+    torch.save({key: value.detach().cpu() for key, value in state.items()}, result_file)
+
+
+def run_single_gpu_streaming_state(
+    result_file: Path,
+    *,
+    container_kind: str,
+    optimizer_name: str,
+    max_grad_norm: Optional[float],
+    pin_cpu_masters=True,
+    resident_suffix_count: int = 0,
+) -> None:
+    """Write streamed one-GPU training state for pytest-side comparison."""
+    if _rank() != 0:
+        return
+    dtype = torch.float32
+    device = _device()
+    torch.manual_seed(20260610)
+    initial_model, module_path = _single_gpu_model_and_path(container_kind, dtype)
+    xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
+    state = train_single_process_streaming(
         initial_model,
         module_path,
         xs_cpu,
         ys_cpu,
-        offload_policy=[True, False, True],
+        offload_policy=True if resident_suffix_count else [True, False, True],
         optimizer_name=optimizer_name,
-        optimizer_kwargs=optimizer_kwargs,
+        optimizer_kwargs=optimizer_kwargs_for(optimizer_name),
         max_grad_norm=max_grad_norm,
         steps=2,
         device=device,
-    )
-    assert_state_dicts_close(streaming.state_dict(), reference.state_dict(), dtype=dtype)
-    torch.save({"ok": True}, result_file)
+        pin_cpu_masters=pin_cpu_masters,
+        resident_suffix_count=resident_suffix_count,
+    ).state_dict()
+    torch.save({key: value.detach().cpu() for key, value in state.items()}, result_file)
 
 
-def run_single_gpu_resident_suffix(result_file: Path) -> None:
-    """Run one-GPU equivalence coverage for resident suffix configuration."""
+def _single_gpu_model_and_path(container_kind: str, dtype: torch.dtype) -> tuple[nn.Module, str]:
+    """Build the small model variant used by one-GPU equivalence cases."""
+    if container_kind == "modulelist":
+        return SandwichModel(dtype=dtype), "layers"
+    if container_kind == "sequential":
+        return SequentialSandwich(dtype=dtype), "blocks"
+    raise ValueError(f"unknown container kind: {container_kind}")
+
+
+def run_kwarg_reference_state(result_file: Path) -> None:
+    """Write ordinary kwarg/nested-output training state for pytest-side comparison."""
     if _rank() != 0:
         return
     dtype = torch.float32
     device = _device()
-    initial_model = SandwichModel(dtype=dtype)
-    xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
+    torch.manual_seed(20260610)
+    initial_model = KwargSandwichModel(dtype=dtype)
+    x, mask, context, y = make_kwarg_batches(dtype)
     optimizer_kwargs = optimizer_kwargs_for("adamw")
-    reference = train_single_process_reference(
-        initial_model,
-        xs_cpu,
-        ys_cpu,
-        optimizer_name="adamw",
-        optimizer_kwargs=optimizer_kwargs,
-        max_grad_norm=None,
-        steps=2,
-        device=device,
-    )
-    streaming = train_single_process_streaming(
-        initial_model,
-        "layers",
-        xs_cpu,
-        ys_cpu,
+    criterion = nn.MSELoss()
+    reference = KwargSandwichModel(dtype=dtype).to(device)
+    reference.load_state_dict(initial_model.state_dict(), strict=True)
+    reference_optimizer = torch.optim.AdamW(reference.parameters(), **optimizer_kwargs)
+    for _ in range(2):
+        reference_optimizer.zero_grad(set_to_none=True)
+        loss = criterion(reference(x.to(device), mask.to(device), context.to(device), scale=0.7), y.to(device))
+        loss.backward()
+        clip_grad_norm_(reference.parameters(), 0.4, foreach=False)
+        reference_optimizer.step()
+    torch.save({key: value.detach().cpu() for key, value in reference.state_dict().items()}, result_file)
+
+
+def run_kwarg_streaming_state(result_file: Path) -> None:
+    """Write streamed kwarg/nested-output training state for pytest-side comparison."""
+    if _rank() != 0:
+        return
+    dtype = torch.float32
+    device = _device()
+    torch.manual_seed(20260610)
+    initial_model = KwargSandwichModel(dtype=dtype)
+    x, mask, context, y = make_kwarg_batches(dtype)
+    optimizer_kwargs = optimizer_kwargs_for("adamw")
+    criterion = nn.MSELoss()
+    streaming_model = KwargSandwichModel(dtype=dtype)
+    streaming_model.load_state_dict(initial_model.state_dict(), strict=True)
+    engine = apply_cpu_streaming_(
+        streaming_model,
+        "decoder.layers",
         offload_policy=True,
-        resident_suffix_count=2,
-        optimizer_name="adamw",
+        optimizer_cls=torch.optim.AdamW,
         optimizer_kwargs=optimizer_kwargs,
-        max_grad_norm=None,
-        steps=2,
+        max_grad_norm=0.4,
         device=device,
-        pin_cpu_masters="eager",
+        auto_init_process_group=False,
+        wrap_ddp=False,
     )
-    assert_state_dicts_equal(streaming.state_dict(), reference.state_dict())
-    torch.save({"ok": True}, result_file)
+    assert isinstance(streaming_model.decoder.layers, CPUStreamingModuleList)
+    for _ in range(2):
+        engine.zero_grad(set_to_none=True)
+        loss = criterion(engine.model(x.to(device), mask.to(device), context.to(device), scale=0.7), y.to(device))
+        loss.backward()
+        engine.step()
+    closed = engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
+    assert closed is not None
+    torch.save({key: value.detach().cpu() for key, value in closed.state_dict().items()}, result_file)
 
 
 def run_transfer_timing(result_file: Path) -> None:
@@ -436,134 +321,6 @@ def run_transfer_timing(result_file: Path) -> None:
         assert timings[kind]["bytes"] > 0
         assert timings[kind]["enqueue_ms"] >= 0.0
     assert any(handle._prefetch_streams for handle in engine.handles)
-    torch.save({"ok": True}, result_file)
-
-
-def run_api_behaviors(result_file: Path) -> None:
-    """Exercise structural API behavior on CUDA without keeping those checks CPU-only."""
-    if _rank() != 0:
-        return
-    device = _device()
-
-    model = SandwichModel(dtype=torch.float32)
-    engine = apply_cpu_streaming_(
-        model,
-        "layers",
-        offload_policy=[True, False, True],
-        optimizer_cls=torch.optim.AdamW,
-        optimizer_kwargs=optimizer_kwargs_for("adamw"),
-        device=device,
-        auto_init_process_group=False,
-        wrap_ddp=False,
-    )
-    assert isinstance(model.layers, CPUStreamingModuleList)
-    assert len(model.layers) == 3
-    out = engine.model(torch.randn(2, 5, device=device))
-    assert out.shape == (2, 3)
-    closed = engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
-    assert closed is not None
-    assert isinstance(closed.layers, nn.ModuleList)
-    assert not isinstance(closed.layers, CPUStreamingModuleList)
-
-    model = SandwichModel(dtype=torch.float32)
-    engine = apply_cpu_streaming_(
-        model,
-        "layers",
-        offload_policy=True,
-        resident_suffix_count=2,
-        optimizer_cls=torch.optim.AdamW,
-        optimizer_kwargs=optimizer_kwargs_for("adamw"),
-        device=device,
-        auto_init_process_group=False,
-        wrap_ddp=False,
-    )
-    assert isinstance(model.layers, CPUStreamingModuleList)
-    assert [stage.offloaded for stage in model.layers] == [True, False, False]
-    assert [handle.qualified_name for handle in engine.handles] == ["layers.0"]
-    engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
-
-    model = SequentialSandwich(dtype=torch.float32)
-    engine = apply_cpu_streaming_to_modulelist_(
-        model,
-        "blocks",
-        offload_policy=True,
-        optimizer_cls=torch.optim.AdamW,
-        optimizer_kwargs=optimizer_kwargs_for("adamw"),
-        device=device,
-        auto_init_process_group=False,
-        wrap_ddp=False,
-    )
-    assert isinstance(model.blocks, CPUStreamingSequential)
-    out = engine.model(torch.randn(2, 5, device=device))
-    assert out.shape == (2, 3)
-    engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
-
-    dtype = torch.float32
-    initial_model = KwargSandwichModel(dtype=dtype)
-    x, mask, context, y = make_kwarg_batches(dtype)
-    optimizer_kwargs = optimizer_kwargs_for("adamw")
-    criterion = nn.MSELoss()
-    reference = KwargSandwichModel(dtype=dtype).to(device)
-    reference.load_state_dict(initial_model.state_dict(), strict=True)
-    reference_optimizer = torch.optim.AdamW(reference.parameters(), **optimizer_kwargs)
-    for _ in range(2):
-        reference_optimizer.zero_grad(set_to_none=True)
-        reference_loss = criterion(reference(x.to(device), mask.to(device), context.to(device), scale=0.7), y.to(device))
-        reference_loss.backward()
-        clip_grad_norm_(reference.parameters(), 0.4, foreach=False)
-        reference_optimizer.step()
-
-    streaming_model = KwargSandwichModel(dtype=dtype)
-    streaming_model.load_state_dict(initial_model.state_dict(), strict=True)
-    engine = apply_cpu_streaming_(
-        streaming_model,
-        "decoder.layers",
-        offload_policy=True,
-        optimizer_cls=torch.optim.AdamW,
-        optimizer_kwargs=optimizer_kwargs,
-        max_grad_norm=0.4,
-        device=device,
-        auto_init_process_group=False,
-        wrap_ddp=False,
-    )
-    assert isinstance(streaming_model.decoder.layers, CPUStreamingModuleList)
-    for _ in range(2):
-        engine.zero_grad(set_to_none=True)
-        streaming_loss = criterion(engine.model(x.to(device), mask.to(device), context.to(device), scale=0.7), y.to(device))
-        streaming_loss.backward()
-        engine.step()
-    closed = engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
-    assert closed is not None
-    assert_state_dicts_close(closed.state_dict(), reference.cpu().state_dict(), dtype=dtype)
-
-    model = SandwichModel(dtype=torch.float32)
-    engine = apply_cpu_streaming_(
-        model,
-        "layers",
-        offload_policy=[True, False, True],
-        optimizer_cls=torch.optim.AdamW,
-        optimizer_kwargs=optimizer_kwargs_for("adamw"),
-        device=device,
-        auto_init_process_group=False,
-        wrap_ddp=False,
-    )
-    counts: Dict[Tuple[str, bool], int] = {}
-    for handle in engine.handles:
-        original = handle.prefetch
-
-        def counted_prefetch(self, device, *, requires_grad: bool, _original=original):
-            """Count prefetch calls while preserving the original behavior."""
-            counts[(self.qualified_name, bool(requires_grad))] = counts.get((self.qualified_name, bool(requires_grad)), 0) + 1
-            return _original(device, requires_grad=requires_grad)
-
-        handle.prefetch = MethodType(counted_prefetch, handle)
-    engine.zero_grad(set_to_none=True)
-    loss = engine.model(torch.randn(4, 5, device=device)).pow(2).mean()
-    loss.backward()
-    assert counts.get(("layers.2", False), 0) >= 1
-    assert counts.get(("layers.0", True), 0) >= 1
-    engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
-
     torch.save({"ok": True}, result_file)
 
 
@@ -634,33 +391,35 @@ def main() -> None:
     parser.add_argument("--container-kind", default="modulelist")
     parser.add_argument("--optimizer-name", default="adamw")
     parser.add_argument("--max-grad-norm", type=float)
+    parser.add_argument("--resident-suffix-count", type=int, default=0)
     args = parser.parse_args()
 
-    if args.case == "ddp-vs-ddp":
-        run_ddp_vs_ddp(args.result_file)
-    elif args.case == "ddp-vs-standard":
-        run_ddp_vs_standard(args.result_file)
-    elif args.case == "reference-ddp-state":
-        run_reference_ddp_state(args.result_file)
-    elif args.case == "streaming-ddp-state":
+    if args.case == "streaming-ddp-state":
         run_streaming_ddp_state(args.result_file)
     elif args.case == "standard-state":
         run_standard_state(args.result_file)
-    elif args.case == "single-gpu-reference":
-        run_single_gpu_reference(args.result_file, args.pin_cpu_masters)
-    elif args.case == "single-gpu-equivalence":
-        run_single_gpu_equivalence(
+    elif args.case == "single-gpu-reference-state":
+        run_single_gpu_reference_state(
             args.result_file,
             container_kind=args.container_kind,
             optimizer_name=args.optimizer_name,
             max_grad_norm=args.max_grad_norm,
         )
-    elif args.case == "single-gpu-resident-suffix":
-        run_single_gpu_resident_suffix(args.result_file)
+    elif args.case == "single-gpu-streaming-state":
+        run_single_gpu_streaming_state(
+            args.result_file,
+            container_kind=args.container_kind,
+            optimizer_name=args.optimizer_name,
+            max_grad_norm=args.max_grad_norm,
+            pin_cpu_masters=False if args.pin_cpu_masters == "false" else args.pin_cpu_masters,
+            resident_suffix_count=args.resident_suffix_count,
+        )
+    elif args.case == "kwarg-reference-state":
+        run_kwarg_reference_state(args.result_file)
+    elif args.case == "kwarg-streaming-state":
+        run_kwarg_streaming_state(args.result_file)
     elif args.case == "transfer-timing":
         run_transfer_timing(args.result_file)
-    elif args.case == "api-behaviors":
-        run_api_behaviors(args.result_file)
     elif args.case == "shared-cpu-storage":
         run_shared_cpu_storage(args.result_file)
     else:
