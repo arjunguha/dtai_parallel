@@ -118,6 +118,26 @@ Run the suite with:
 PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
 ```
 
-In this CPU-only environment the CUDA cases skip automatically.  The suite includes single-process equivalence tests, mixed resident/offloaded tests, nested `decoder.layers` transformation tests, arbitrary `*args`/`**kwargs` and nested-output tests, prefetch-scheduling tests, shared `/dev/shm` storage tests, and a real two-process DDP equivalence check using Gloo on CPU or NCCL on CUDA.
+In this CPU-only environment the CUDA cases skip automatically.  The suite includes single-process equivalence tests, mixed resident/offloaded tests, nested `decoder.layers` transformation tests, arbitrary `*args`/`**kwargs` and nested-output tests, prefetch-scheduling tests, shared `/dev/shm` storage tests, and real DDP equivalence checks using Gloo on CPU or NCCL on CUDA. CUDA tests launch their CUDA workers with `torchrun`, including one-process CUDA cases.
 
 For distributed memory studies, prefer proportional set size from `/proc/self/smaps_rollup`; RSS counts shared pages in every rank and will overstate the physical CPU footprint of shared offloaded state.
+
+## Benchmarks
+
+The larger memory studies live outside pytest so the test suite stays focused on fast invariants. Synthetic streaming memory benchmarks can be run with:
+
+```bash
+CUDA_VISIBLE_DEVICES=2,4 uv run python -m benchmarks.streaming_memory run --mode two-gpu
+```
+
+For one-GPU benchmark cases, use one torchrun process over the first visible GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=2,4 uv run python -m benchmarks.streaming_memory run --mode one-gpu
+```
+
+Qwen2.5-Coder-14B memory benchmarks are also standalone and skip from pytest when the local model is unavailable:
+
+```bash
+CUDA_VISIBLE_DEVICES=2,4 uv run python -m benchmarks.qwen_memory run --mode two-gpu
+```
