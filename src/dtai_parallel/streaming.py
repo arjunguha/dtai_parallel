@@ -1110,10 +1110,9 @@ class _OffloadedModuleHandle:
         *,
         optimizer_cls: Type[torch.optim.Optimizer],
         optimizer_kwargs: Mapping[str, Any],
-        optimizer_device: torch.device,
         clip_coef: Optional[Tensor],
     ) -> None:
-        """Stage this layer's optimizer inputs to the optimizer device on a side stream."""
+        """Stage this layer's optimizer inputs to the local device on a side stream."""
 
         self.wait_optimizer_commit()
         self.clear_prefetch()
@@ -1128,14 +1127,14 @@ class _OffloadedModuleHandle:
         if rank != self.owner_rank:
             return
 
-        stream = self._optimizer_prefetch_stream(optimizer_device)
+        stream = self._optimizer_prefetch_stream(self.local_device)
         staged_parameters: List[nn.Parameter] = []
         with torch.cuda.stream(stream):
             for name, cpu_parameter in named_parameters:
                 staged = nn.Parameter(
                     _copy_tensor_to_device(
                         cpu_parameter.detach(),
-                        optimizer_device,
+                        self.local_device,
                         metrics=self.metrics,
                         kind="optimizer_param_h2d",
                         pinned_transfer_buffer=self.pinned_transfer_buffer,
@@ -1145,7 +1144,7 @@ class _OffloadedModuleHandle:
                 if cpu_parameter.grad is not None:
                     staged.grad = _copy_tensor_to_device(
                         cpu_parameter.grad.detach(),
-                        optimizer_device,
+                        self.local_device,
                         metrics=self.metrics,
                         kind="optimizer_grad_h2d",
                         pinned_transfer_buffer=self.pinned_transfer_buffer,
@@ -1160,7 +1159,7 @@ class _OffloadedModuleHandle:
                 if saved_state is not None:
                     optimizer.state[staged] = _Tree.to_device(
                         saved_state,
-                        optimizer_device,
+                        self.local_device,
                         metrics=self.metrics,
                         pinned_transfer_buffer=self.pinned_transfer_buffer,
                     )
@@ -1180,7 +1179,6 @@ class _OffloadedModuleHandle:
         *,
         optimizer_cls: Type[torch.optim.Optimizer],
         optimizer_kwargs: Mapping[str, Any],
-        optimizer_device: torch.device,
         clip_coef: Optional[Tensor],
     ) -> _PrefetchedOptimizerStep:
         with self._lock:
@@ -1191,7 +1189,6 @@ class _OffloadedModuleHandle:
             self.prefetch_optimizer_step(
                 optimizer_cls=optimizer_cls,
                 optimizer_kwargs=optimizer_kwargs,
-                optimizer_device=optimizer_device,
                 clip_coef=clip_coef,
             )
             with self._lock:
@@ -1201,7 +1198,7 @@ class _OffloadedModuleHandle:
                 raise RuntimeError("failed to prefetch optimizer step")
 
         if prefetched.event is not None:
-            current = torch.cuda.current_stream(optimizer_device)
+            current = torch.cuda.current_stream(self.local_device)
             current.wait_event(prefetched.event)
             for staged in prefetched.staged_parameters:
                 staged.data.record_stream(current)
@@ -1218,9 +1215,7 @@ class _OffloadedModuleHandle:
         named_parameters: List[Tuple[str, nn.Parameter]],
         staged_parameters: List[nn.Parameter],
         optimizer: Optional[torch.optim.Optimizer],
-        optimizer_device: torch.device,
     ) -> None:
-        del optimizer_device
         for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
             byte_count = _tensor_nbytes(staged)
 
@@ -1375,7 +1370,6 @@ class _OffloadedModuleHandle:
         *,
         optimizer_cls: Type[torch.optim.Optimizer],
         optimizer_kwargs: Mapping[str, Any],
-        optimizer_device: torch.device,
         clip_coef: Optional[Tensor],
     ) -> None:
         """Run a PyTorch optimizer for this stage on its owner rank.
@@ -1401,7 +1395,7 @@ class _OffloadedModuleHandle:
                     staged = nn.Parameter(
                         _copy_tensor_to_device(
                             cpu_parameter.detach(),
-                            optimizer_device,
+                            self.local_device,
                             metrics=self.metrics,
                             kind="optimizer_param_h2d",
                             pinned_transfer_buffer=self.pinned_transfer_buffer,
@@ -1411,7 +1405,7 @@ class _OffloadedModuleHandle:
                     if cpu_parameter.grad is not None:
                         staged.grad = _copy_tensor_to_device(
                             cpu_parameter.grad.detach(),
-                            optimizer_device,
+                            self.local_device,
                             metrics=self.metrics,
                             kind="optimizer_grad_h2d",
                             pinned_transfer_buffer=self.pinned_transfer_buffer,
@@ -1424,7 +1418,7 @@ class _OffloadedModuleHandle:
                     if saved_state is not None:
                         optimizer.state[staged] = _Tree.to_device(
                             saved_state,
-                            optimizer_device,
+                            self.local_device,
                             metrics=self.metrics,
                             pinned_transfer_buffer=self.pinned_transfer_buffer,
                         )
@@ -1453,7 +1447,6 @@ class _OffloadedModuleHandle:
             prefetched = self._consume_optimizer_step(
                 optimizer_cls=optimizer_cls,
                 optimizer_kwargs=optimizer_kwargs,
-                optimizer_device=optimizer_device,
                 clip_coef=clip_coef,
             )
             named_parameters = prefetched.named_parameters
@@ -1472,14 +1465,13 @@ class _OffloadedModuleHandle:
                 named_parameters=named_parameters,
                 staged_parameters=staged_parameters,
                 optimizer=optimizer,
-                optimizer_device=optimizer_device,
             )
         for name, cpu_parameter in named_parameters:
             cpu_parameter.grad = None
         dist.barrier(group=self.process_group)
         self._release_shared_gradients(name for name, _ in named_parameters)
         del optimizer, staged_parameters
-        self.evict_device(optimizer_device)
+        self.evict_device(self.local_device)
 
     def materialize(self, device: torch.device) -> nn.Module:
         self.wait_optimizer_commit()
@@ -1810,7 +1802,6 @@ class CPUStreamingEngine:
         local_device: torch.device,
         optimizer_cls: Type[torch.optim.Optimizer],
         optimizer_kwargs: Mapping[str, Any],
-        optimizer_device: Optional[torch.device],
         max_grad_norm: Optional[float],
         grad_norm_type: float,
         error_if_nonfinite: bool,
@@ -1824,7 +1815,6 @@ class CPUStreamingEngine:
         self.module_path = module_path
         self.streaming_container = streaming_container
         self.local_device = local_device
-        self.optimizer_device = optimizer_device or local_device
         self.optimizer_cls = optimizer_cls
         self.optimizer_kwargs = dict(optimizer_kwargs)
         self.max_grad_norm = max_grad_norm
@@ -1946,7 +1936,6 @@ class CPUStreamingEngine:
             self.handles[0].prefetch_optimizer_step(
                 optimizer_cls=self.optimizer_cls,
                 optimizer_kwargs=self.optimizer_kwargs,
-                optimizer_device=self.optimizer_device,
                 clip_coef=cuda_clip_coef,
             )
 
@@ -1956,13 +1945,11 @@ class CPUStreamingEngine:
                 self.handles[next_index].prefetch_optimizer_step(
                     optimizer_cls=self.optimizer_cls,
                     optimizer_kwargs=self.optimizer_kwargs,
-                    optimizer_device=self.optimizer_device,
                     clip_coef=cuda_clip_coef,
                 )
             handle.optimizer_step(
                 optimizer_cls=self.optimizer_cls,
                 optimizer_kwargs=self.optimizer_kwargs,
-                optimizer_device=self.optimizer_device,
                 clip_coef=cuda_clip_coef,
             )
             if index > 0:
@@ -2120,7 +2107,6 @@ def apply_cpu_streaming_(
     grad_norm_type: float = 2.0,
     error_if_nonfinite: bool = False,
     device: Optional[DeviceLike] = None,
-    optimizer_device: Optional[DeviceLike] = None,
     process_group: Optional[Any] = None,
     ddp_kwargs: Optional[Mapping[str, Any]] = None,
     close_rank: int = 0,
@@ -2208,7 +2194,6 @@ def apply_cpu_streaming_(
         local_device=local_device,
         optimizer_cls=optimizer_cls,
         optimizer_kwargs=dict(optimizer_kwargs or {}),
-        optimizer_device=_normalize_device(optimizer_device) if optimizer_device is not None else None,
         max_grad_norm=max_grad_norm,
         grad_norm_type=grad_norm_type,
         error_if_nonfinite=error_if_nonfinite,
