@@ -14,6 +14,7 @@ import torch.distributed as dist
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModelForCausalLM
+from tqdm.auto import tqdm
 
 from dtai_parallel import apply_cpu_streaming_
 from tests.support.torchrun import run_torchrun
@@ -367,17 +368,17 @@ def run_benchmark(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
-    for mode in args.mode:
-        for seq_len in args.seq_len:
-            row = run_case_with_torchrun(
-                mode=mode,
-                model_ref=model_ref,
-                seq_len=seq_len,
-                output_dir=output_dir,
-                resident_suffix_count=args.resident_suffix_count,
-            )
-            assert_qwen_invariants(row)
-            rows.append(row)
+    cases = [(mode, seq_len) for mode in args.mode for seq_len in args.seq_len]
+    for mode, seq_len in tqdm(cases, desc="Qwen memory benchmarks", unit="case"):
+        row = run_case_with_torchrun(
+            mode=mode,
+            model_ref=model_ref,
+            seq_len=seq_len,
+            output_dir=output_dir,
+            resident_suffix_count=args.resident_suffix_count,
+        )
+        assert_qwen_invariants(row)
+        rows.append(row)
     (output_dir / "summary.json").write_text(json.dumps([asdict(row) for row in rows], indent=2), encoding="utf-8")
     print_table(rows)
 

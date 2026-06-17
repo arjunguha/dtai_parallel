@@ -1,43 +1,20 @@
-"""In-place CPU streaming for an existing model's ``ModuleList`` or ``Sequential``.
+"""CPU-master streaming for a torchrun-launched PyTorch model.
 
-The public API is a transformation, not a base class:
+The public API mutates an existing model by replacing one ordered submodule,
+usually a decoder ``ModuleList`` or ``Sequential``, with streaming stage wrappers.
+The rest of the model remains ordinary PyTorch code and is wrapped in
+``DistributedDataParallel`` by the engine returned from ``apply_cpu_streaming_``.
 
-    model = TransformerLikeModel(...)
-    engine = apply_cpu_streaming_(model, "decoder.layers", ...)
+Every run uses a torchrun process group, including one-rank runs.  Offloaded
+stages keep their true parameters, gradients, and optimizer-state tensors in
+file-backed CPU storage under ``/dev/shm``.  A stage streams temporary parameter
+copies to the process-local device for forward and backward replay, then the
+engine averages offloaded gradients, runs PyTorch optimizers on stage owners, and
+broadcasts the updated CPU masters.
 
-    for tokens, targets in loader:
-        engine.zero_grad()
-        loss = criterion(engine.model(tokens.to(engine.local_device)), targets.to(engine.local_device))
-        loss.backward()
-        engine.step()
-
-    ordinary_model = engine.close()
-
-The model object remains the model written by the user.  The transformation only
-replaces one ordered submodule, usually a list of decoder blocks, with an ordered
-container of stage wrappers.  Existing forward code such as
-
-    for layer in self.decoder.layers:
-        hidden = layer(hidden, attention_mask=mask, rotary=rotary, use_cache=False)
-
-continues to work because the replacement is still iterable.  If the target is an
-``nn.Sequential``, calling it directly also continues to work.
-
-The code requires the usual ``torchrun`` layout, including one-GPU runs: one
-Python process owns one local GPU and has an initialized process group.  Each
-process forwards only its local batch.  Resident parameters remain ordinary
-registered parameters.  The engine always wraps the transformed model in
-``DistributedDataParallel`` so resident parameters use normal PyTorch DDP.  The
-parameters in offloaded stages are hidden from the module tree, kept as
-file-backed CPU masters, streamed asynchronously to the local device, and
-synchronized by the engine.
-
-The comments and docstrings are intentionally explanatory.  The implementation
-still includes the requested practical mechanisms: arbitrary positional and
-keyword arguments containing tensors, nested tensor outputs, autograd replay for
-streamed parameters, asynchronous CUDA prefetch streams, DDP for resident modules,
-optimizer dispatch to PyTorch optimizer classes, integrated gradient clipping,
-and materialization back to an ordinary model in ``close()``.
+The transformed model still accepts normal positional and keyword tensor
+arguments, supports nested tensor outputs, overlaps CUDA copies through side
+streams, and materializes back to a standard PyTorch model through ``close()``.
 """
 
 from __future__ import annotations
@@ -79,12 +56,12 @@ def _env_flag(name: str, *, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class StreamingConfig:
-    """A compact record of the engine configuration.
+    """Record the shape of a streaming engine after construction.
 
-    The dataclass is not required by the algorithm.  It is useful in tests,
-    checkpoints, logs, and examples because it records which submodule was
-    transformed, which device this torchrun process owns, which optimizer class is
-    being dispatched, and whether DDP was enabled for resident parameters.
+    This object is a small piece of observability rather than a control surface.
+    It captures the transformed module path, the process-local device, the
+    optimizer family, and the distributed rank information that define a run.
+    Tests and examples can inspect it without walking the internal engine state.
     """
 
     module_path: str
@@ -100,7 +77,13 @@ class StreamingConfig:
 
 
 class StreamingTransferMetrics:
-    """Low-overhead transfer timing counters collected by the streaming engine."""
+    """Measure the movement of tensors between CPU masters and devices.
+
+    Streaming performance is dominated by copies that are otherwise easy to hide
+    inside helper functions.  This collector keeps low-overhead counters for
+    bytes, host enqueue time, and CUDA event time so benchmarks can report where
+    transfer work happened without changing the training algorithm.
+    """
 
     def __init__(self, *, enabled: bool = False) -> None:
         self.enabled = bool(enabled)
@@ -175,13 +158,14 @@ class StreamingTransferMetrics:
 
 
 class _Tree:
-    """Move opaque PyTorch optimizer state between devices.
+    """Move optimizer state as an opaque tree of Python containers.
 
-    AdamW, Adam, SGD with momentum, and many other PyTorch optimizers store state
-    in nested Python containers.  The streaming engine deliberately treats that
-    state as an opaque tree.  Tensor leaves are moved and cloned; non-tensor leaves
-    are deep-copied.  This is the small piece that lets the engine dispatch to
-    PyTorch optimizer classes instead of reimplementing optimizer equations.
+    PyTorch optimizers store state in ordinary dictionaries, lists, tuples, and
+    tensors.  The streaming engine treats that structure as data owned by the
+    optimizer implementation.  Tensor leaves are copied between CPU storage and
+    the process-local device, while non-tensor leaves are deep-copied so the
+    engine can dispatch to real PyTorch optimizers without reimplementing their
+    update rules.
     """
 
     @staticmethod
@@ -310,7 +294,14 @@ def _tensor_nbytes(tensor: Tensor) -> int:
 
 
 class _PinnedTransferBuffer:
-    """Reusable pinned CPU staging buffers for pageable-CPU to CUDA copies."""
+    """Stage pageable CPU tensors through reusable pinned memory.
+
+    CPU masters live in file-backed storage, which is not itself pinned.  CUDA
+    copies from pageable memory serialize more than the streaming path wants, so
+    this helper maintains per-dtype pinned buffers and records CUDA events before
+    reusing them.  The result is still a normal tensor copy, but it can overlap
+    with compute on CUDA side streams.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -395,13 +386,13 @@ def _clip_coef(total_norm: Tensor, *, max_norm: float, error_if_nonfinite: bool)
 
 
 class _RNGSnapshot:
-    """Save enough RNG state to replay a stochastic layer during backward.
+    """Preserve random-number state across forward and backward replay.
 
-    Offloaded stages run their forward under ``no_grad`` and reconstruct the
-    graph in backward by replaying the layer with streamed parameters that require
-    gradients.  Dropout and similar stochastic operations must see the same random
-    choices during replay, so the custom autograd boundary records CPU and CUDA
-    RNG state before the forward call and temporarily restores it for replay.
+    Offloaded stages run their original forward without building a parameter
+    graph.  During backward the same stage is replayed with streamed parameters
+    that require gradients.  Stochastic layers such as dropout must make the same
+    random choices in both passes, so the autograd boundary records CPU and CUDA
+    RNG state and restores it only for the replayed call.
     """
 
     def __init__(self, device: torch.device) -> None:
@@ -444,14 +435,13 @@ def _is_differentiable_tensor(value: Tensor) -> bool:
 
 
 class _TensorTreeSpec:
-    """A small tensor-only pytree specification.
+    """Describe a nested Python value by the positions of its tensor leaves.
 
-    PyTorch's internal pytree utilities are powerful, but the streaming boundary
-    needs a slightly different split: tensor leaves travel through autograd, while
-    non-tensor leaves are replay-time constants.  This helper records enough
-    structure to rebuild positional arguments, keyword arguments, and nested
-    tensor outputs.  Lists, tuples, namedtuples, dictionaries, and OrderedDicts are
-    traversed.  Other Python objects are treated as constants.
+    The custom autograd boundary can directly pass tensors, but model layers may
+    receive and return nested Python structures.  This specification records the
+    container shape for lists, tuples, namedtuples, dictionaries, and
+    ``OrderedDict`` values.  Tensor leaves flow through autograd, while other
+    objects remain replay-time constants.
     """
 
     def __init__(self, spec: Any, tensor_count: int) -> None:
@@ -513,13 +503,12 @@ class _TensorTreeSpec:
 
 
 class _OutputHolder:
-    """Mutable bridge from ``autograd.Function.forward`` back to the wrapper.
+    """Bridge arbitrary layer outputs through ``torch.autograd.Function``.
 
-    ``torch.autograd.Function`` can return a tuple of tensors, but it cannot
-    directly return an arbitrary Python pytree.  The forward method flattens the
-    differentiable tensor leaves and stores the output tree specification here.
-    The stage wrapper receives the tensor tuple from ``apply`` and reconstructs
-    the user's original output structure.
+    A custom autograd function returns tensors, not an arbitrary Python pytree.
+    The stage wrapper therefore asks this holder to remember how the original
+    output was flattened.  After ``apply`` returns, the holder reconstructs the
+    same nested output shape that the user's layer produced.
     """
 
     def __init__(self) -> None:
@@ -544,7 +533,13 @@ class _OutputHolder:
 
 @dataclass
 class _CallSpec:
-    """Flattened representation of ``module(*args, **kwargs)``."""
+    """Remember a stage call so it can be reconstructed during backward.
+
+    Forward and backward replay must agree on the exact positional and keyword
+    structure supplied to the user layer.  This object stores that structure and
+    records which input tensors originally required gradients, allowing replay to
+    request input gradients only where the original call did.
+    """
 
     spec: _TensorTreeSpec
     tensor_requires_grad: Tuple[bool, ...]
@@ -585,7 +580,12 @@ def _require_process_group(process_group: Optional[Any] = None) -> None:
 
 
 def _infer_local_device() -> torch.device:
-    """Infer the single local device used by this torchrun process."""
+    """Choose the device owned by the current torchrun process.
+
+    Each process is responsible for one local batch and one local device.  CUDA
+    runs use ``LOCAL_RANK`` to select the visible GPU for this process, while CPU
+    execution keeps the same process-group structure on the CPU backend.
+    """
 
     if torch.cuda.is_available():
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -606,12 +606,12 @@ def _normalize_device(device: DeviceLike) -> torch.device:
 
 
 def _init_process_group_from_torchrun(device: torch.device) -> None:
-    """Initialize ``torch.distributed`` from torchrun environment variables.
+    """Create the distributed process group required by the engine.
 
-    ``torchrun`` starts processes and sets ``RANK``, ``WORLD_SIZE``,
-    ``MASTER_ADDR``, and ``MASTER_PORT``.  It does not call
-    ``dist.init_process_group`` inside the program.  This helper initializes only
-    when the relevant environment variables are present.
+    ``torchrun`` supplies rank, world-size, and rendezvous information through
+    environment variables.  The streaming engine requires that group even for a
+    one-rank run because the implementation always uses the same broadcast and
+    reduction path for CPU masters.
     """
 
     if not dist.is_available():
@@ -631,7 +631,12 @@ def _init_process_group_from_torchrun(device: torch.device) -> None:
 
 
 def _collective_tensor_device(tensor: Tensor, local_device: torch.device, process_group: Optional[Any]) -> torch.device:
-    """Choose a legal device for collectives under the active backend."""
+    """Select a legal staging device for the active collective backend.
+
+    NCCL collectives operate on CUDA tensors, while CPU collectives use CPU
+    tensors.  Offloaded masters and gradients may be stored on CPU, so this
+    helper centralizes the temporary device choice before a broadcast or reduce.
+    """
 
     backend = _backend(process_group)
     if backend == "nccl":
@@ -642,7 +647,13 @@ def _collective_tensor_device(tensor: Tensor, local_device: torch.device, proces
 
 
 def _all_reduce_mean_(tensor: Tensor, local_device: torch.device, process_group: Optional[Any]) -> Tensor:
-    """All-reduce ``tensor`` and return an averaged tensor on the original device."""
+    """Average a tensor across all ranks and return it on its original device.
+
+    Offloaded gradients are accumulated locally before the optimizer step.  This
+    helper performs the rank-wide mean through the backend-compatible staging
+    device and then copies the result back to the storage location expected by
+    the caller.
+    """
 
     _require_process_group(process_group)
     original_device = tensor.device
@@ -656,7 +667,13 @@ def _all_reduce_mean_(tensor: Tensor, local_device: torch.device, process_group:
 
 
 def _broadcast_tensor_(tensor: Tensor, src: int, local_device: torch.device, process_group: Optional[Any]) -> None:
-    """Broadcast into ``tensor`` in place, using a backend-compatible staging tensor."""
+    """Broadcast an updated master tensor into every rank's local view.
+
+    Stage owners run optimizer updates for their assigned offloaded layers.  The
+    updated tensors then need to become visible to the other ranks before the
+    next training step.  This helper performs that synchronization while hiding
+    the backend-specific staging details.
+    """
 
     _require_process_group(process_group)
     comm_device = _collective_tensor_device(tensor, local_device, process_group)
@@ -668,7 +685,13 @@ def _broadcast_tensor_(tensor: Tensor, src: int, local_device: torch.device, pro
 
 
 class _SharedCpuStore:
-    """File-backed CPU tensors shared by same-host distributed ranks."""
+    """Manage the file-backed CPU tensors used as offloaded masters.
+
+    All ranks on the host map the same files under ``/dev/shm`` for parameter,
+    buffer, gradient, and optimizer-state tensor storage.  The store validates
+    that ranks are colocated on one host, creates or adopts the shared-memory
+    directory, and hands out tensor views backed by named files.
+    """
 
     _SHM_ROOT = os.path.realpath("/dev/shm")
 
@@ -777,7 +800,13 @@ class _SharedCpuStore:
 
 
 def _resolve_module_path(root: nn.Module, path: str) -> Tuple[nn.Module, str, nn.Module]:
-    """Return ``(parent, child_name, child)`` for a dotted module path."""
+    """Resolve a dotted module path to the object that will be replaced.
+
+    The transformation is deliberately narrow: it replaces one ordered child
+    module inside the user model.  Resolving the parent as well as the child lets
+    the engine swap in a streaming container and later materialize a normal copy
+    without changing the surrounding model code.
+    """
 
     if not path:
         raise ValueError("module_path must be a non-empty dotted path")
@@ -850,7 +879,12 @@ def _tensor_device_for_call(flat_tensors: Sequence[Tensor], local_device: torch.
 
 @dataclass
 class _PrefetchedState:
-    """A staged parameter/buffer dictionary, optionally produced on a CUDA stream."""
+    """Hold temporary parameter and buffer copies prepared for one stage call.
+
+    A prefetch may complete synchronously on CPU or asynchronously on a CUDA side
+    stream.  The state object records the stream event that protects those copies
+    and waits on it before the stage consumes the tensors.
+    """
 
     device: torch.device
     requires_grad: bool
@@ -877,12 +911,13 @@ class _PrefetchedOptimizerStep:
 
 
 class _OffloadedModuleHandle:
-    """Hidden CPU master state for one streamed layer.
+    """Own the shared CPU masters and optimizer state for one offloaded stage.
 
-    The handle is deliberately not an ``nn.Module``.  A stage wrapper stores it in
-    a plain Python attribute, so the CPU master parameters are invisible to
-    ``model.parameters()`` and to DDP.  The engine explicitly synchronizes their
-    gradients and optimizer updates.
+    The handle is not an ``nn.Module`` and is stored as a plain Python attribute
+    on the wrapper stage.  That choice keeps offloaded parameters invisible to
+    DDP and to ``model.parameters()``.  The engine therefore takes explicit
+    responsibility for streaming these tensors, reducing their gradients, running
+    their owner-rank optimizer steps, and broadcasting updated masters.
     """
 
     def __init__(
@@ -1065,11 +1100,12 @@ class _OffloadedModuleHandle:
             self._prefetched = None
 
     def prefetch(self, device: torch.device, *, requires_grad: bool) -> None:
-        """Stage this layer's parameters and buffers for a later call.
+        """Prepare parameter and buffer copies for the next use of this stage.
 
-        On CUDA, copies are issued on a side stream and the returned state is
-        protected by an event.  On CPU, the operation is necessarily synchronous,
-        but keeping the same interface makes the correctness tests device-agnostic.
+        Forward prefetches ordinary detached copies, while backward replay
+        prefetches parameter copies that can receive gradients.  CUDA copies are
+        issued on a side stream and guarded by an event; CPU execution follows
+        the same state-machine shape with synchronous copies.
         """
 
         if device.type != self.local_device.type or (device.type == "cuda" and device.index != self.local_device.index):
@@ -1112,7 +1148,14 @@ class _OffloadedModuleHandle:
         optimizer_kwargs: Mapping[str, Any],
         clip_coef: Optional[Tensor],
     ) -> None:
-        """Stage this layer's optimizer inputs to the local device on a side stream."""
+        """Prepare the owner-rank optimizer inputs ahead of the optimizer step.
+
+        Optimizer work needs temporary device parameters, their reduced
+        gradients, and any existing opaque PyTorch optimizer state.  This method
+        builds that short-lived optimizer state on a CUDA side stream so the
+        later synchronous optimizer step can begin with the inputs already
+        staged.
+        """
 
         self.wait_optimizer_commit()
         self.clear_prefetch()
@@ -1251,7 +1294,13 @@ class _OffloadedModuleHandle:
         return output, params
 
     def accumulate_local_gradients(self, grads_by_name: Mapping[str, Optional[Tensor]]) -> None:
-        """Accumulate local, not-yet-averaged gradients for offloaded params."""
+        """Accumulate gradients produced by this rank's backward replay.
+
+        Backward replay computes gradients for the streamed parameter copies, not
+        directly for the CPU masters.  The handle gathers those gradients by
+        parameter name, merges them with any prior accumulation for the local
+        rank, and writes them back to shared CPU storage for the later reduction.
+        """
 
         with self._lock:
             parameters = self.parameters_by_name
@@ -1280,7 +1329,14 @@ class _OffloadedModuleHandle:
                     target.grad.add_(grad.detach())
 
     def synchronize_gradients(self) -> None:
-        """Average accumulated offloaded gradients across torchrun ranks."""
+        """Average offloaded gradients and leave the result on the stage owner.
+
+        Resident parameters rely on DDP for gradient synchronization.  Offloaded
+        parameters are hidden from DDP, so their gradients are explicitly
+        all-reduced here.  After the mean is computed, non-owner ranks discard
+        their copy and the owner rank keeps the reduced gradient for its optimizer
+        update.
+        """
 
         if self.local_device.type == "cuda":
             for name, parameter in self.parameters_by_name.items():
@@ -1361,7 +1417,12 @@ class _OffloadedModuleHandle:
                 parameter.grad.mul_(coef)
 
     def evict_device(self, device: torch.device) -> None:
-        """Drop temporary staged state owned by this prototype."""
+        """Release temporary streamed state for this stage.
+
+        The CPU master tensors remain in shared storage.  Eviction only clears
+        prefetched device copies that are safe to recreate from those masters on
+        the next forward, backward replay, or optimizer step.
+        """
 
         self.clear_prefetch()
 
@@ -1372,13 +1433,13 @@ class _OffloadedModuleHandle:
         optimizer_kwargs: Mapping[str, Any],
         clip_coef: Optional[Tensor],
     ) -> None:
-        """Run a PyTorch optimizer for this stage on its owner rank.
+        """Run the PyTorch optimizer update for this offloaded stage.
 
-        Optimizer state is sharded by stage owner: rank ``stage_index %
-        world_size`` owns the state and performs the update.  The updated CPU
-        master weights are then broadcast to the other ranks.  This keeps the
-        optimizer algorithm delegated to PyTorch while avoiding replicated AdamW
-        state for offloaded layers.
+        Ownership is assigned by stage index, so only one rank constructs the
+        temporary optimizer and mutates the CPU masters for a given stage.  The
+        optimizer algorithm remains PyTorch's implementation; after it runs, the
+        resulting parameter tensors and optimizer-state tensor leaves are copied
+        back into shared CPU storage for the next training step.
         """
 
         self.clear_prefetch()
@@ -1479,7 +1540,14 @@ class _OffloadedModuleHandle:
 
 
 class _OffloadedStageFunction(torch.autograd.Function):
-    """Autograd boundary that saves activations but not device parameter copies."""
+    """Autograd boundary for stages whose parameters are streamed from CPU.
+
+    Forward runs the user module under ``no_grad`` with temporary streamed state,
+    saving only the input tensor leaves and the call structure.  Backward restores
+    the RNG state, replays the same module with gradient-tracking parameter
+    copies, and returns input gradients while handing parameter gradients to the
+    offloaded handle.
+    """
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -1590,7 +1658,13 @@ class _OffloadedStageFunction(torch.autograd.Function):
 
 
 class _StreamingStage(nn.Module):
-    """One item inside a transformed ModuleList or Sequential."""
+    """Represent one item inside the transformed ordered container.
+
+    A stage either owns an ordinary resident module or points at an offloaded
+    handle.  The wrapper provides the common call surface, schedules neighboring
+    prefetches, and keeps the transformed ``ModuleList`` or ``Sequential``
+    compatible with user-written model forwards.
+    """
 
     def __init__(
         self,
@@ -1668,11 +1742,12 @@ class _StreamingStage(nn.Module):
 
 
 class CPUStreamingModuleList(nn.ModuleList):
-    """A drop-in iterable replacement for a transformed ``nn.ModuleList``.
+    """Provide a streaming-aware replacement for a user ``ModuleList``.
 
-    Standard ``ModuleList`` has no forward method.  This replacement remains
-    iterable for existing user-written loops, and it also provides a convenience
-    forward that chains the stages when called directly.
+    Many transformer models iterate over a ``ModuleList`` directly in their
+    forward method.  This replacement preserves that iterable behavior while each
+    item becomes a streaming stage.  It also offers a convenience forward method
+    that chains stages for simple sequential test models.
     """
 
     def __init__(self, modules: Iterable[_StreamingStage]) -> None:
@@ -1719,11 +1794,13 @@ class CPUStreamingModuleList(nn.ModuleList):
 
 
 class CPUStreamingSequential(nn.Sequential):
-    """A callable replacement for a transformed ``nn.Sequential``.
+    """Provide a streaming-aware replacement for a user ``Sequential``.
 
-    Unlike vanilla ``nn.Sequential``, this forward accepts arbitrary arguments for
-    the first stage.  Each later stage receives the previous stage's output as its
-    single positional argument, matching the usual sequential-composition rule.
+    The replacement keeps the familiar sequential composition rule: the first
+    stage receives the original call and each later stage receives the previous
+    output.  It accepts the same richer first-call structure used by offloaded
+    stages, so keyword-heavy model blocks can still be tested through a
+    sequential container.
     """
 
     def __init__(self, modules: Optional[OrderedDict[str, _StreamingStage]] = None) -> None:
@@ -1784,13 +1861,12 @@ class CPUStreamingSequential(nn.Sequential):
 
 
 class CPUStreamingEngine:
-    """Companion object returned by the in-place transformation.
+    """Own training orchestration for a transformed model.
 
-    The engine is not the model.  It owns optimizer state for offloaded layers, a
-    normal PyTorch optimizer for resident parameters, and, when distributed
-    training is active, the DDP-wrapped model exposed as ``.model``.  The training
-    loop calls ``engine.zero_grad()``, computes ``loss.backward()`` through
-    ``engine.model``, and calls ``engine.step()``.
+    The engine exposes the DDP-wrapped model used by the training loop, the
+    resident optimizer, the offloaded stage handles, transfer metrics, and the
+    materialization path that turns the transformed model back into ordinary
+    PyTorch modules.
     """
 
     def __init__(
@@ -1905,7 +1981,13 @@ class CPUStreamingEngine:
             handle.scale_gradients_(clip_coef)
 
     def step(self) -> Optional[Tensor]:
-        """Synchronize offloaded gradients, optionally clip, and run optimizers."""
+        """Complete one optimizer step for resident and offloaded parameters.
+
+        The caller performs forward and backward through ``engine.model``.  This
+        method then reduces offloaded gradients, computes the combined gradient
+        norm for optional clipping, steps the resident DDP-visible optimizer, and
+        dispatches each offloaded stage to its owner-rank optimizer update.
+        """
 
         if self._closed:
             raise RuntimeError("close() has been called; create a new engine for more training")
@@ -1962,11 +2044,12 @@ class CPUStreamingEngine:
         return total_norm
 
     def transfer_timing_summary(self, *, reset: bool = False, synchronize: bool = True) -> Dict[str, Dict[str, float]]:
-        """Return accumulated transfer timing counters.
+        """Return the accumulated transfer accounting for benchmark reporting.
 
-        ``enqueue_ms`` is host-side time spent issuing copies.  ``cuda_ms`` is
-        measured with CUDA events and therefore reflects device-stream copy time
-        for transfers that ran on CUDA streams.
+        The summary groups counters by transfer kind.  It records byte counts,
+        host enqueue time, and CUDA event time, which lets benchmark code report
+        both the volume of streaming traffic and the observed copy time on CUDA
+        streams.
         """
 
         return self.transfer_metrics.summary(reset=reset, synchronize=synchronize)
@@ -1979,13 +2062,13 @@ class CPUStreamingEngine:
         yield from self.model.parameters()
 
     def materialize(self, device: Optional[DeviceLike] = None) -> nn.Module:
-        """Return a normal copy of the transformed model with no streaming wrappers.
+        """Create a normal PyTorch copy with streaming wrappers removed.
 
-        The hidden offload handles contain locks and optimizer state, so an
-        ordinary ``copy.deepcopy`` of the live transformed model is not the right
-        operation.  Instead the engine temporarily swaps the transformed submodule
-        for an ordinary materialized container, deep-copies the resulting normal
-        model, and then puts the streaming container back.
+        The live transformed model contains hidden handles, locks, shared-memory
+        tensors, and optimizer state.  A plain deep copy would capture that
+        machinery.  Materialization temporarily swaps the transformed submodule
+        for ordinary modules, deep-copies the user model, and restores the live
+        streaming container.
         """
 
         target_device = torch.device(device) if device is not None else self.local_device
@@ -2001,11 +2084,12 @@ class CPUStreamingEngine:
         return model_copy.to(target_device)
 
     def close(self, *, return_on_all_ranks: bool = False, device: Optional[DeviceLike] = None) -> Optional[nn.Module]:
-        """Evict temporary device state and return a normal model on rank 0.
+        """Finish a streaming run and release the shared CPU store.
 
-        By default only ``close_rank`` returns the materialized model; other ranks
-        return ``None``.  This mirrors typical checkpointing under ``torchrun``.
-        Pass ``return_on_all_ranks=True`` when every rank should get a copy.
+        Closing synchronizes ranks, evicts temporary device state, materializes
+        the final ordinary model on the configured rank set, and removes the
+        engine-created ``/dev/shm`` directory.  After close, the engine is no
+        longer a training object.
         """
 
         if self._closed:
@@ -2113,54 +2197,19 @@ def apply_cpu_streaming_(
     collect_timing: Optional[bool] = None,
     shared_cpu_dir: Optional[str] = None,
 ) -> CPUStreamingEngine:
-    """Transform ``model.<module_path>`` in place and return a training engine.
+    """Replace an ordered submodule with streaming stages and return an engine.
 
-    Parameters
-    ----------
-    model:
-        The existing model object.  The function mutates it by replacing one
-        ordered submodule.  The surrounding embedding, normalization, and head
-        modules remain ordinary resident PyTorch modules.
-    module_path:
-        Dotted path to an ``nn.ModuleList`` or ``nn.Sequential`` inside ``model``;
-        examples include ``"layers"`` and ``"decoder.layers"``.
-    offload_policy:
-        ``True`` offloads every item in the list.  ``False`` keeps every item
-        resident.  A sequence of booleans controls individual stages.  A callable
-        receives ``(index, name, module)`` and returns a boolean.
-    resident_suffix_count:
-        Number of trailing items in the target ``ModuleList`` or ``Sequential``
-        to keep resident, regardless of ``offload_policy``.  For example,
-        ``offload_policy=True, resident_suffix_count=2`` offloads all but the
-        final two stages.
-    optimizer_cls, optimizer_kwargs:
-        A real PyTorch optimizer class and its keyword arguments.  One optimizer
-        is constructed for resident parameters.  Offloaded stages construct
-        short-lived optimizers during ``step()`` and restore their opaque state.
-    max_grad_norm:
-        If set, ``step()`` clips the combined resident and offloaded gradients
-        after all DDP/offloaded reductions and before any optimizer update.
-    device:
-        The single local device for this torchrun process.  If omitted, CUDA uses
-        ``LOCAL_RANK`` when available; CPU is used otherwise.
-    ddp_kwargs:
-        Optional keyword arguments for the ``DistributedDataParallel`` wrapper
-        used for resident parameters.
-    collect_timing:
-        When true, collect per-transfer enqueue time, byte counts, and CUDA event
-        durations.  If omitted, ``DTAI_PARALLEL_TIMING=1`` enables collection.
-    shared_cpu_dir:
-        Optional directory for offloaded CPU state.  Offloaded CPU weights,
-        gradients, and optimizer-state tensors are always file-backed shared
-        memory.  This directory must resolve under ``/dev/shm``.  If omitted,
-        rank 0 creates a temporary directory under ``/dev/shm`` and broadcasts it
-        to the other same-host ranks.
+    The transformation keeps resident parts of the model under DDP while moving
+    selected stages into shared CPU-master storage.  The returned engine owns the
+    training-time optimizer orchestration and exposes ``engine.model`` for the
+    forward pass used by the caller's training loop.
 
-    Returns
-    -------
-    CPUStreamingEngine
-        The companion object that owns optimizer state, exposes the model to use
-        in the training loop, and materializes a normal model in ``close()``.
+    The function requires the torchrun process-group layout for every run.  It
+    creates the shared CPU store, wraps resident parameters with DDP, assigns
+    ownership of offloaded stages across ranks, and leaves the caller with a
+    small training protocol: zero gradients through the engine, run forward and
+    backward through ``engine.model``, call ``engine.step()``, and finally call
+    ``engine.close()`` to recover an ordinary model.
     """
 
     local_device = _normalize_device(device) if device is not None else _infer_local_device()
@@ -2205,8 +2254,8 @@ def apply_cpu_streaming_(
     )
 
 
-# Backwards-compatible alias retained for the first prototype and for readers who
-# want the target type spelled out.  The shorter name is the preferred API.
+# Public aliases for callers that prefer either the concise transformation name
+# or a name that spells out the ordered-container target.
 apply_cpu_streaming_to_modulelist_ = apply_cpu_streaming_
 apply_cpu_streaming = apply_cpu_streaming_
 

@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from tqdm.auto import tqdm
 
 from dtai_parallel import apply_cpu_streaming_
 from tests.models import LargeStreamingSandwich, STREAM_INPUT_DIM, STREAM_OUTPUT_DIM
@@ -408,16 +409,16 @@ def run_benchmark(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
-    for mode in args.mode:
-        for num_layers, layer_param_scale in parse_cases(args.case):
-            row = run_case_with_torchrun(
-                mode=mode,
-                num_layers=num_layers,
-                layer_param_scale=layer_param_scale,
-                output_dir=output_dir,
-            )
-            assert_memory_invariants(row, require_cpu_lower_bound=mode == "two-gpu")
-            rows.append(row)
+    cases = [(mode, num_layers, scale) for mode in args.mode for num_layers, scale in parse_cases(args.case)]
+    for mode, num_layers, layer_param_scale in tqdm(cases, desc="streaming memory benchmarks", unit="case"):
+        row = run_case_with_torchrun(
+            mode=mode,
+            num_layers=num_layers,
+            layer_param_scale=layer_param_scale,
+            output_dir=output_dir,
+        )
+        assert_memory_invariants(row, require_cpu_lower_bound=mode == "two-gpu")
+        rows.append(row)
     (output_dir / "summary.json").write_text(
         json.dumps([asdict(row) for row in rows], indent=2),
         encoding="utf-8",

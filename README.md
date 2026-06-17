@@ -1,143 +1,137 @@
-# CPU-master streaming for a transformed ModuleList
+# DTAI Parallel CPU Streaming
 
-This is a compact PyTorch reference implementation of a GH200-oriented training abstraction: keep offloaded decoder-block parameters, gradients, and optimizer state as CPU masters, and stream one layer at a time to the process-local device.  The API is an in-place transformation on an existing model, not a replacement base class.
+This package provides CPU-master streaming for PyTorch models launched with
+`torchrun`. The public API is an in-place transformation: choose an ordered
+submodule such as `layers` or `decoder.layers`, replace it with streaming stage
+wrappers, and train through the engine returned by `apply_cpu_streaming_`.
 
-```python
-engine = apply_cpu_streaming_(model, "decoder.layers", ...)
-```
+The transformed model keeps its normal Python structure. Surrounding modules such
+as embeddings, norms, heads, and resident decoder blocks remain ordinary PyTorch
+modules. The engine wraps the model in `DistributedDataParallel`, so resident
+parameters follow PyTorch's standard distributed path.
 
-The model remains the model the user wrote.  The transformation replaces only the selected `nn.ModuleList` or `nn.Sequential`; surrounding modules such as embeddings, norms, and unembeddings remain ordinary resident modules.
+Offloaded stages keep their true parameters, buffers, gradients, and
+optimizer-state tensor leaves as file-backed CPU masters under `/dev/shm`. During
+forward and backward, each stage streams temporary tensor copies to the
+process-local device. Backward replays the stage with gradient-tracking parameter
+copies, the engine averages offloaded gradients across ranks, and the owner rank
+for each stage runs the PyTorch optimizer update before the next step.
 
-## Intended torchrun shape
+## Training Loop
 
-The implementation requires the common `torchrun` layout, including one-GPU runs: one process owns one GPU and every process has an initialized `torch.distributed` process group.  Each process forwards only its local batch.  The training loop is responsible for moving input tensors to the process-local device.
-
-The engine always wraps the transformed model in `torch.nn.parallel.DistributedDataParallel`.  This automatically handles resident parameters.  Offloaded parameters are hidden from the module tree, so DDP does not see them; the engine explicitly averages their gradients and dispatches their optimizer steps.
-
-Offloaded CPU state assumes all ranks are on the same host.  Offloaded CPU master weights, reduced gradients, and optimizer-state tensor storage are mandatory file-backed shared memory under `/dev/shm`, even for one-rank runs.  If ranks report different hostnames, or a configured shared-memory directory does not resolve under `/dev/shm`, initialization fails.
-
-## What is streamed
-
-For an offloaded stage, the CPU master module owns the true parameters and buffers.  Forward prefetches the stage's parameter and buffer state to the local device, calls the layer with the user's original `*args` and `**kwargs`, saves activations, and drops the temporary streamed state.  Backward replays the same layer under autograd with streamed parameter copies that require gradients, accumulates local parameter gradients into the CPU master, and then `engine.step()` averages them across ranks.
-
-The optimizer path does not implement AdamW or SGD equations.  For each offloaded stage, the engine constructs the requested PyTorch optimizer class on temporary device parameters, restores that stage's opaque optimizer state, calls `optimizer.step()`, and writes the updated weights and optimizer state back to CPU.  In distributed runs, each stage owner performs the optimizer step and writes tensor leaves into shared CPU storage; Python optimizer metadata remains local to the owner rank.  Resident parameters use one ordinary PyTorch optimizer attached to DDP-visible parameters.
-
-Asynchronous prefetching is implemented for CUDA with side streams and events.  During forward, a stage schedules the next offloaded stage.  During backward, a stage schedules the previous offloaded stage.  On CPU the same interface is used, but prefetching is necessarily synchronous.
-
-## Minimal usage
+Training code launches under `torchrun`, then uses the engine as the optimizer
+and distributed coordination object. The forward and backward pass still run
+through a normal PyTorch module interface exposed as `engine.model`.
 
 ```python
 import torch
 from torch import nn
-from cpu_streaming_ddp import apply_cpu_streaming_
 
-class Decoder(nn.Module):
-    def __init__(self, block_factory, n_layers):
+from dtai_parallel import apply_cpu_streaming_
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, width):
         super().__init__()
-        self.layers = nn.ModuleList([block_factory() for _ in range(n_layers)])
+        self.net = nn.Sequential(
+            nn.LayerNorm(width),
+            nn.Linear(width, 4 * width),
+            nn.GELU(),
+            nn.Linear(4 * width, width),
+        )
+
+    def forward(self, hidden, *, attention_mask=None):
+        return hidden + self.net(hidden)
+
 
 class Model(nn.Module):
-    def __init__(self):
+    def __init__(self, block_factory, vocab_size, width, depth):
         super().__init__()
-        self.embed = nn.Embedding(32000, 4096)
-        self.decoder = Decoder(lambda: MyDecoderBlock(), n_layers=32)
-        self.norm = nn.LayerNorm(4096)
-        self.lm_head = nn.Linear(4096, 32000, bias=False)
+        self.embed = nn.Embedding(vocab_size, width)
+        self.layers = nn.ModuleList([block_factory(width) for _ in range(depth)])
+        self.norm = nn.LayerNorm(width)
+        self.head = nn.Linear(width, vocab_size, bias=False)
 
-    def forward(self, tokens, *, attention_mask=None, position_ids=None):
-        x = self.embed(tokens)
-        for layer in self.decoder.layers:
-            x = layer(
-                x,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-        return self.lm_head(self.norm(x))
+    def forward(self, tokens, *, attention_mask=None):
+        hidden = self.embed(tokens)
+        for layer in self.layers:
+            hidden = layer(hidden, attention_mask=attention_mask)
+        return self.head(self.norm(hidden))
 
-model = Model()
+
+model = Model(block_factory=DecoderBlock, vocab_size=32000, width=4096, depth=32)
 engine = apply_cpu_streaming_(
     model,
-    "decoder.layers",
+    "layers",
     offload_policy=True,
+    resident_suffix_count=2,
     optimizer_cls=torch.optim.AdamW,
     optimizer_kwargs={"lr": 1e-4, "weight_decay": 0.01, "foreach": False},
     max_grad_norm=1.0,
 )
 
 criterion = nn.CrossEntropyLoss()
-for tokens, labels, attention_mask in loader:
-    tokens = tokens.to(engine.local_device)
-    labels = labels.to(engine.local_device)
-    attention_mask = attention_mask.to(engine.local_device)
+
+for batch in loader:
+    tokens = batch["tokens"].to(engine.local_device)
+    labels = batch["labels"].to(engine.local_device)
+    attention_mask = batch["attention_mask"].to(engine.local_device)
 
     engine.zero_grad(set_to_none=True)
     logits = engine.model(tokens, attention_mask=attention_mask)
     loss = criterion(logits.flatten(0, 1), labels.flatten())
     loss.backward()
-    total_norm = engine.step()
+    engine.step()
 
-ordinary_model = engine.close()
+final_model = engine.close()
 ```
 
-`ordinary_model` is returned only on rank 0 by default.  Use `engine.close(return_on_all_ranks=True)` when every rank should receive a materialized copy.  The returned model contains a normal `nn.ModuleList` or `nn.Sequential`, not streaming wrappers.
+The returned `final_model` is an ordinary PyTorch model on the close rank. Its
+transformed submodule has been materialized back into a normal `ModuleList` or
+`Sequential`.
 
-## Mixed resident and offloaded layers
+## Offload Policy
 
-`offload_policy` can be a single boolean, a sequence of booleans, or a callable receiving `(index, name, module)`.  For example, this offloads every other decoder block while leaving the rest resident and DDP-managed:
+`offload_policy=True` streams every item in the selected ordered submodule.
+`offload_policy=False` keeps every item resident. A boolean sequence controls
+individual stages, and a callable can make the decision from the stage index,
+name, and module.
 
 ```python
 engine = apply_cpu_streaming_(
     model,
     "decoder.layers",
-    offload_policy=lambda i, name, module: i % 2 == 0,
+    offload_policy=lambda index, name, module: index % 2 == 0,
     optimizer_cls=torch.optim.AdamW,
     optimizer_kwargs={"lr": 3e-4, "foreach": False},
 )
 ```
 
-Use `resident_suffix_count` to force a trailing suffix of the transformed list to
-stay resident regardless of the offload policy:
-
-```python
-engine = apply_cpu_streaming_(
-    model,
-    "decoder.layers",
-    offload_policy=True,
-    resident_suffix_count=4,  # offload all but the last four decoder blocks
-    optimizer_cls=torch.optim.AdamW,
-    optimizer_kwargs={"lr": 3e-4, "foreach": False},
-)
-```
+`resident_suffix_count` keeps the final stages resident after the offload policy
+has been evaluated. This is useful for decoder stacks that benefit from keeping
+the last few blocks on device.
 
 ## Tests
 
-Run the suite with:
+Run the full test suite with:
 
 ```bash
-PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
+uv run pytest -q
 ```
 
-In this CPU-only environment the CUDA cases skip automatically.  The suite includes torchrun-backed equivalence tests, mixed resident/offloaded tests, nested `decoder.layers` transformation tests, arbitrary `*args`/`**kwargs` and nested-output tests, transfer-timing tests, shared `/dev/shm` storage tests, and NCCL-backed multi-GPU equivalence checks. CUDA tests launch their CUDA workers with `torchrun`, including one-process CUDA cases.
-
-For distributed memory studies, prefer proportional set size from `/proc/self/smaps_rollup`; RSS counts shared pages in every rank and will overstate the physical CPU footprint of shared offloaded state.
+The tests cover result equivalence, torchrun launch behavior, shared CPU storage,
+mixed resident and offloaded stages, nested module paths, arbitrary tensor
+arguments, nested tensor outputs, transfer timing, and memory benchmark
+invariants.
 
 ## Benchmarks
 
-The larger memory studies live outside pytest so the test suite stays focused on fast invariants. Synthetic streaming memory benchmarks can be run with:
+Run all benchmark entrypoints with:
 
 ```bash
-CUDA_VISIBLE_DEVICES=2,4 uv run python -m benchmarks.streaming_memory run --mode two-gpu
+uv run python -m benchmarks.streaming_memory run --mode one-gpu --mode two-gpu && uv run python -m benchmarks.qwen_memory run --mode one-gpu --mode two-gpu
 ```
 
-For one-GPU benchmark cases, use one torchrun process over the first visible GPU:
-
-```bash
-CUDA_VISIBLE_DEVICES=2,4 uv run python -m benchmarks.streaming_memory run --mode one-gpu
-```
-
-Qwen2.5-Coder-14B memory benchmarks are also standalone and skip from pytest when the local model is unavailable:
-
-```bash
-CUDA_VISIBLE_DEVICES=2,4 uv run python -m benchmarks.qwen_memory run --mode two-gpu
-```
+The benchmark CLIs launch their measured cases through `torchrun`, print a
+`tqdm` progress bar over the case list, write per-case JSON payloads, and write a
+`summary.json` file under `benchmark-results/`.
