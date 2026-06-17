@@ -172,11 +172,13 @@ def run_worker_case(
     """Run one Qwen benchmark case inside a torchrun worker process."""
     world_size = _world_size()
     distributed = world_size > 1
-    if distributed:
+    device = torch.device("cuda", _local_rank())
+    torch.cuda.set_device(device)
+    try:
+        dist.init_process_group(backend="nccl", device_id=device)
+    except TypeError:
         dist.init_process_group(backend="nccl")
     try:
-        device = torch.device("cuda", _local_rank())
-        torch.cuda.set_device(device)
         torch.cuda.empty_cache()
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -198,13 +200,9 @@ def run_worker_case(
             optimizer_kwargs={"lr": 1e-5, "betas": (0.9, 0.95), "eps": 1e-8, "weight_decay": 0.01, "foreach": False},
             max_grad_norm=1.0,
             device=device,
-            auto_init_process_group=False,
-            wrap_ddp=distributed,
             close_rank=0,
-            pin_cpu_masters="lazy" if not distributed else True,
         )
-        if distributed:
-            assert isinstance(engine.model, DDP)
+        assert isinstance(engine.model, DDP)
 
         tracker = IterationMemoryTracker(device, distributed=distributed)
         records: List[Dict[str, float]] = []

@@ -101,7 +101,6 @@ def train_single_process_streaming(
     max_grad_norm: Optional[float],
     steps: int,
     device: torch.device,
-    pin_cpu_masters=True,
     resident_suffix_count: int = 0,
 ) -> nn.Module:
     """Train a streamed model through the public engine API for equivalence checks."""
@@ -115,9 +114,6 @@ def train_single_process_streaming(
         optimizer_kwargs=optimizer_kwargs,
         max_grad_norm=max_grad_norm,
         device=device,
-        wrap_ddp=False,
-        auto_init_process_group=False,
-        pin_cpu_masters=pin_cpu_masters,
     )
     criterion = nn.MSELoss()
     for _ in range(steps):

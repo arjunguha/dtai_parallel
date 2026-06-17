@@ -60,44 +60,6 @@ def test_single_gpu_streaming_matches_single_process_reference(
     assert_state_dicts_close(stream_state, ref_state, dtype=torch.float32)
 
 
-@pytest.mark.parametrize("pin_cpu_masters", ["eager", "lazy", False])
-def test_single_gpu_streaming_pin_modes_match_single_process_reference(pin_cpu_masters) -> None:
-    """Compare one-GPU streamed training pinning modes against ordinary training."""
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
-        pytest.skip("needs at least one CUDA device")
-
-    pin_arg = "false" if pin_cpu_masters is False else str(pin_cpu_masters)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ref_file = os.path.join(tmpdir, "ref.pt")
-        stream_file = os.path.join(tmpdir, "stream.pt")
-        _run_state(
-            "single-gpu-reference-state",
-            ref_file,
-            nproc_per_node=1,
-            extra_args=["--container-kind", "modulelist", "--optimizer-name", "adamw", "--max-grad-norm", "0.5"],
-        )
-        _run_state(
-            "single-gpu-streaming-state",
-            stream_file,
-            nproc_per_node=1,
-            extra_args=[
-                "--container-kind",
-                "modulelist",
-                "--optimizer-name",
-                "adamw",
-                "--max-grad-norm",
-                "0.5",
-                "--pin-cpu-masters",
-                pin_arg,
-            ],
-        )
-
-        ref_state = _load_state(ref_file)
-        stream_state = _load_state(stream_file)
-
-    assert_state_dicts_close(stream_state, ref_state, dtype=torch.float32)
-
-
 def test_single_gpu_resident_suffix_matches_single_process_reference() -> None:
     """Compare resident-suffix streamed training against ordinary one-GPU training."""
     if not torch.cuda.is_available() or torch.cuda.device_count() < 1:

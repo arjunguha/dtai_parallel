@@ -170,16 +170,17 @@ def run_worker_case(
     num_layers: int,
     layer_width: int,
     result_file: Path,
-    pin_cpu_masters,
 ) -> None:
     """Run one benchmark case inside the torchrun worker process."""
     world_size = _world_size()
     distributed = world_size > 1
-    if distributed:
+    device = torch.device("cuda", _local_rank())
+    torch.cuda.set_device(device)
+    try:
+        dist.init_process_group(backend="nccl", device_id=device)
+    except TypeError:
         dist.init_process_group(backend="nccl")
     try:
-        device = torch.device("cuda", _local_rank())
-        torch.cuda.set_device(device)
         torch.cuda.empty_cache()
 
         model = LargeStreamingSandwich(num_layers, layer_width)
@@ -197,13 +198,9 @@ def run_worker_case(
             optimizer_kwargs={"lr": 3e-4, "betas": (0.9, 0.95), "eps": 1e-8, "weight_decay": 0.01, "foreach": False},
             max_grad_norm=1.0,
             device=device,
-            auto_init_process_group=False,
-            wrap_ddp=distributed,
             collect_timing=True,
-            pin_cpu_masters=pin_cpu_masters,
         )
-        if distributed:
-            assert isinstance(engine.model, DDP)
+        assert isinstance(engine.model, DDP)
 
         criterion = nn.MSELoss()
         tracker = IterationMemoryTracker(device, distributed=distributed)
@@ -319,7 +316,6 @@ def run_case_with_torchrun(
     num_layers: int,
     layer_param_scale: float,
     output_dir: Path,
-    pin_cpu_masters="eager",
 ) -> MemoryRow:
     """Launch one benchmark case through torchrun and load its result row."""
     layer_width = layer_width_for_config(num_layers, layer_param_scale)
@@ -337,8 +333,6 @@ def run_case_with_torchrun(
             str(layer_width),
             "--result-file",
             str(result_file),
-            "--pin-cpu-masters",
-            str(pin_cpu_masters).lower(),
         ],
         nproc_per_node=nproc,
     )
@@ -421,7 +415,6 @@ def run_benchmark(args: argparse.Namespace) -> None:
                 num_layers=num_layers,
                 layer_param_scale=layer_param_scale,
                 output_dir=output_dir,
-                pin_cpu_masters=args.pin_cpu_masters,
             )
             assert_memory_invariants(row, require_cpu_lower_bound=mode == "two-gpu")
             rows.append(row)
@@ -442,24 +435,20 @@ def main() -> None:
     worker.add_argument("--num-layers", type=int, required=True)
     worker.add_argument("--layer-width", type=int, required=True)
     worker.add_argument("--result-file", type=Path, required=True)
-    worker.add_argument("--pin-cpu-masters", default="eager")
 
     bench = subparsers.add_parser("run")
     bench.add_argument("--gpus", help="Physical GPU list for CUDA_VISIBLE_DEVICES, for example 2,4")
     bench.add_argument("--mode", action="append", choices=["one-gpu", "two-gpu"], default=None)
     bench.add_argument("--case", action="append", help="Case as layers:scale, for example 8:0.5")
     bench.add_argument("--output-dir", default="benchmark-results/streaming-memory")
-    bench.add_argument("--pin-cpu-masters", default="eager")
 
     args = parser.parse_args()
     if args.command == "worker":
-        pin_cpu_masters = False if args.pin_cpu_masters == "false" else args.pin_cpu_masters
         run_worker_case(
             mode=args.mode,
             num_layers=args.num_layers,
             layer_width=args.layer_width,
             result_file=args.result_file,
-            pin_cpu_masters=pin_cpu_masters,
         )
     else:
         if args.mode is None:

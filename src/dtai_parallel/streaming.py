@@ -23,14 +23,14 @@ container of stage wrappers.  Existing forward code such as
 continues to work because the replacement is still iterable.  If the target is an
 ``nn.Sequential``, calling it directly also continues to work.
 
-The code assumes the usual ``torchrun`` layout: one Python process owns one local
-GPU.  Each process forwards only its local batch.  Resident parameters remain
-ordinary registered parameters.  When a distributed process group with world size
-larger than one is active, the engine wraps the transformed model in
+The code requires the usual ``torchrun`` layout, including one-GPU runs: one
+Python process owns one local GPU and has an initialized process group.  Each
+process forwards only its local batch.  Resident parameters remain ordinary
+registered parameters.  The engine always wraps the transformed model in
 ``DistributedDataParallel`` so resident parameters use normal PyTorch DDP.  The
-parameters in offloaded stages are hidden from the module tree, kept as CPU
-masters, streamed asynchronously to the local device, and synchronized by the
-engine.
+parameters in offloaded stages are hidden from the module tree, kept as
+file-backed CPU masters, streamed asynchronously to the local device, and
+synchronized by the engine.
 
 The comments and docstrings are intentionally explanatory.  The implementation
 still includes the requested practical mechanisms: arbitrary positional and
@@ -58,7 +58,6 @@ import torch
 import torch.distributed as dist
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.nn.utils import clip_grad_norm_
 
 try:  # PyTorch >= 2.0.  The tests in this project run on PyTorch 2.10.
     from torch.func import functional_call
@@ -68,7 +67,6 @@ except Exception:  # pragma: no cover
 
 DeviceLike = Union[str, torch.device]
 OffloadPolicy = Union[bool, Sequence[bool], Callable[[int, str, nn.Module], bool]]
-PinCpuMasters = Union[bool, str]
 _SENTINEL = "__cpu_streaming_ddp_tensor_leaf__"
 
 
@@ -193,8 +191,7 @@ class _Tree:
         *,
         metrics: Optional[StreamingTransferMetrics] = None,
         kind: str = "optimizer_state_h2d",
-        pin_source: bool = False,
-        pinned_transfer_buffer: Optional["_PinnedTransferBuffer"] = None,
+        pinned_transfer_buffer: "_PinnedTransferBuffer",
     ) -> Any:
         if torch.is_tensor(value):
             return _copy_tensor_to_device(
@@ -202,7 +199,6 @@ class _Tree:
                 device,
                 metrics=metrics,
                 kind=kind,
-                pin_source=pin_source,
                 pinned_transfer_buffer=pinned_transfer_buffer,
             )
         if isinstance(value, dict):
@@ -212,7 +208,6 @@ class _Tree:
                     device,
                     metrics=metrics,
                     kind=kind,
-                    pin_source=pin_source,
                     pinned_transfer_buffer=pinned_transfer_buffer,
                 )
                 for k, v in value.items()
@@ -224,7 +219,6 @@ class _Tree:
                     device,
                     metrics=metrics,
                     kind=kind,
-                    pin_source=pin_source,
                     pinned_transfer_buffer=pinned_transfer_buffer,
                 )
                 for v in value
@@ -236,7 +230,6 @@ class _Tree:
                     device,
                     metrics=metrics,
                     kind=kind,
-                    pin_source=pin_source,
                     pinned_transfer_buffer=pinned_transfer_buffer,
                 )
                 for v in value
@@ -249,30 +242,26 @@ class _Tree:
         *,
         metrics: Optional[StreamingTransferMetrics] = None,
         kind: str = "optimizer_state_d2h",
-        pin_memory: bool = True,
-        shared_cpu_store: Optional["_SharedCpuStore"] = None,
+        shared_cpu_store: "_SharedCpuStore",
         shared_key: str = "optimizer_state",
     ) -> Any:
         if torch.is_tensor(value):
-            if shared_cpu_store is not None:
-                out = shared_cpu_store.tensor_like(shared_key, value.detach())
-                byte_count = _tensor_nbytes(value)
+            out = shared_cpu_store.tensor_like(shared_key, value.detach())
+            byte_count = _tensor_nbytes(value)
 
-                def copy_fn() -> Tensor:
-                    out.copy_(value.detach(), non_blocking=False)
-                    return out
+            def copy_fn() -> Tensor:
+                out.copy_(value.detach(), non_blocking=False)
+                return out
 
-                if metrics is None:
-                    return copy_fn()
-                return metrics.record_copy(kind, byte_count, value.device, copy_fn)
-            return _copy_tensor_to_cpu(value.detach(), metrics=metrics, kind=kind, pin_memory=pin_memory)
+            if metrics is None:
+                return copy_fn()
+            return metrics.record_copy(kind, byte_count, value.device, copy_fn)
         if isinstance(value, dict):
             return {
                 k: _Tree.detach_cpu(
                     v,
                     metrics=metrics,
                     kind=kind,
-                    pin_memory=pin_memory,
                     shared_cpu_store=shared_cpu_store,
                     shared_key=f"{shared_key}.{k}",
                 )
@@ -284,7 +273,6 @@ class _Tree:
                     v,
                     metrics=metrics,
                     kind=kind,
-                    pin_memory=pin_memory,
                     shared_cpu_store=shared_cpu_store,
                     shared_key=f"{shared_key}.{index}",
                 )
@@ -296,7 +284,6 @@ class _Tree:
                     v,
                     metrics=metrics,
                     kind=kind,
-                    pin_memory=pin_memory,
                     shared_cpu_store=shared_cpu_store,
                     shared_key=f"{shared_key}.{index}",
                 )
@@ -318,54 +305,8 @@ class _Tree:
             for item in value:
                 _Tree.record_stream(item, stream)
 
-    @staticmethod
-    def detach_pageable_cpu(value: Any) -> Any:
-        if torch.is_tensor(value):
-            if value.device.type != "cpu":
-                raise ValueError("detach_pageable_cpu expects CPU tensors")
-            out = _empty_cpu_like(value, pin_memory=False)
-            out.copy_(value, non_blocking=False)
-            return out
-        if isinstance(value, dict):
-            return {k: _Tree.detach_pageable_cpu(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [_Tree.detach_pageable_cpu(v) for v in value]
-        if isinstance(value, tuple):
-            return tuple(_Tree.detach_pageable_cpu(v) for v in value)
-        return copy.deepcopy(value)
-
-
 def _tensor_nbytes(tensor: Tensor) -> int:
     return int(tensor.numel() * tensor.element_size())
-
-
-def _pin_tensor_if_possible(tensor: Tensor) -> Tensor:
-    if tensor.device.type != "cpu" or tensor.is_pinned():
-        return tensor
-    try:
-        return tensor.pin_memory()
-    except RuntimeError:
-        return tensor
-
-
-def _pin_module_cpu_tensors_if_possible_(module: nn.Module) -> None:
-    for parameter in module.parameters(recurse=True):
-        parameter.data = _pin_tensor_if_possible(parameter.detach())
-    for buffer in module.buffers(recurse=True):
-        buffer.data = _pin_tensor_if_possible(buffer.detach())
-
-
-def _normalize_pin_cpu_masters(value: PinCpuMasters) -> Tuple[bool, bool]:
-    if isinstance(value, bool):
-        return value, False
-    mode = value.lower()
-    if mode in {"eager", "true", "1", "yes", "on"}:
-        return True, False
-    if mode == "lazy":
-        return False, True
-    if mode in {"false", "0", "no", "off", "none"}:
-        return False, False
-    raise ValueError("pin_cpu_masters must be True, False, 'eager', or 'lazy'")
 
 
 class _PinnedTransferBuffer:
@@ -408,57 +349,18 @@ def _copy_tensor_to_device(
     *,
     metrics: Optional[StreamingTransferMetrics],
     kind: str,
-    pin_source: bool = False,
-    pinned_transfer_buffer: Optional[_PinnedTransferBuffer] = None,
+    pinned_transfer_buffer: _PinnedTransferBuffer,
 ) -> Tensor:
     byte_count = _tensor_nbytes(tensor)
-    source = _pin_tensor_if_possible(tensor) if pin_source and pinned_transfer_buffer is None and tensor.device.type == "cpu" else tensor
 
     def copy_fn() -> Tensor:
-        if pinned_transfer_buffer is not None and tensor.device.type == "cpu" and device.type == "cuda":
+        if tensor.device.type == "cpu" and device.type == "cuda":
             return pinned_transfer_buffer.copy_to_device(tensor, device)
-        return source.to(device=device, non_blocking=True, copy=True)
+        return tensor.to(device=device, non_blocking=True, copy=True)
 
     if metrics is None:
         return copy_fn()
     return metrics.record_copy(kind, byte_count, device, copy_fn)
-
-
-def _empty_cpu_like(tensor: Tensor, *, pin_memory: bool) -> Tensor:
-    try:
-        return torch.empty_like(tensor, device=torch.device("cpu"), memory_format=torch.preserve_format, pin_memory=pin_memory)
-    except (RuntimeError, TypeError):
-        return torch.empty_like(tensor, device=torch.device("cpu"), memory_format=torch.preserve_format)
-
-
-def _copy_tensor_to_cpu(
-    tensor: Tensor,
-    *,
-    metrics: Optional[StreamingTransferMetrics],
-    kind: str,
-    like: Optional[Tensor] = None,
-    pin_memory: Optional[bool] = None,
-) -> Tensor:
-    if tensor.device.type == "cpu":
-        return tensor.detach().clone()
-
-    should_pin = (
-        bool(tensor.device.type == "cuda" and (like is None or (like.device.type == "cpu" and like.is_pinned())))
-        if pin_memory is None
-        else bool(pin_memory)
-    )
-    out = _empty_cpu_like(tensor, pin_memory=should_pin)
-    byte_count = _tensor_nbytes(tensor)
-
-    def copy_fn() -> Tensor:
-        out.copy_(tensor, non_blocking=True)
-        return out
-
-    if metrics is None:
-        copy_fn()
-    else:
-        metrics.record_copy(kind, byte_count, tensor.device, copy_fn)
-    return out
 
 
 def _grad_total_norm(gradients: Iterable[Tensor], *, norm_type: float, device: torch.device) -> Optional[Tensor]:
@@ -662,26 +564,24 @@ class _CallSpec:
 # ---------------------------------------------------------------------------
 
 
-def _distributed_is_active(process_group: Optional[Any] = None) -> bool:
-    return dist.is_available() and dist.is_initialized() and dist.get_world_size(process_group) > 1
-
-
 def _world_size(process_group: Optional[Any] = None) -> int:
-    if _distributed_is_active(process_group):
-        return int(dist.get_world_size(process_group))
-    return 1
+    _require_process_group(process_group)
+    return int(dist.get_world_size(process_group))
 
 
 def _rank(process_group: Optional[Any] = None) -> int:
-    if _distributed_is_active(process_group):
-        return int(dist.get_rank(process_group))
-    return 0
+    _require_process_group(process_group)
+    return int(dist.get_rank(process_group))
 
 
 def _backend(process_group: Optional[Any] = None) -> Optional[str]:
-    if not _distributed_is_active(process_group):
-        return None
+    _require_process_group(process_group)
     return str(dist.get_backend(process_group)).lower()
+
+
+def _require_process_group(process_group: Optional[Any] = None) -> None:
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("CPU streaming requires torchrun or an initialized torch.distributed process group")
 
 
 def _infer_local_device() -> torch.device:
@@ -705,7 +605,7 @@ def _normalize_device(device: DeviceLike) -> torch.device:
     return normalized
 
 
-def _maybe_auto_init_process_group(auto_init: bool, device: torch.device) -> None:
+def _init_process_group_from_torchrun(device: torch.device) -> None:
     """Initialize ``torch.distributed`` from torchrun environment variables.
 
     ``torchrun`` starts processes and sets ``RANK``, ``WORLD_SIZE``,
@@ -714,12 +614,12 @@ def _maybe_auto_init_process_group(auto_init: bool, device: torch.device) -> Non
     when the relevant environment variables are present.
     """
 
-    if not auto_init:
-        return
-    if not dist.is_available() or dist.is_initialized():
+    if not dist.is_available():
+        raise RuntimeError("CPU streaming requires torch.distributed")
+    if dist.is_initialized():
         return
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        return
+        raise RuntimeError("CPU streaming requires torchrun environment variables RANK and WORLD_SIZE")
     backend = "nccl" if device.type == "cuda" else "gloo"
     if backend == "nccl":
         try:
@@ -744,8 +644,7 @@ def _collective_tensor_device(tensor: Tensor, local_device: torch.device, proces
 def _all_reduce_mean_(tensor: Tensor, local_device: torch.device, process_group: Optional[Any]) -> Tensor:
     """All-reduce ``tensor`` and return an averaged tensor on the original device."""
 
-    if not _distributed_is_active(process_group):
-        return tensor
+    _require_process_group(process_group)
     original_device = tensor.device
     comm_device = _collective_tensor_device(tensor, local_device, process_group)
     work = tensor.detach().to(comm_device, non_blocking=True).clone()
@@ -759,8 +658,7 @@ def _all_reduce_mean_(tensor: Tensor, local_device: torch.device, process_group:
 def _broadcast_tensor_(tensor: Tensor, src: int, local_device: torch.device, process_group: Optional[Any]) -> None:
     """Broadcast into ``tensor`` in place, using a backend-compatible staging tensor."""
 
-    if not _distributed_is_active(process_group):
-        return
+    _require_process_group(process_group)
     comm_device = _collective_tensor_device(tensor, local_device, process_group)
     work = tensor.detach().to(comm_device, non_blocking=True).clone()
     dist.broadcast(work, src=src, group=process_group)
@@ -787,10 +685,8 @@ class _SharedCpuStore:
         *,
         requested_dir: Optional[str],
         process_group: Optional[Any],
-    ) -> Optional["_SharedCpuStore"]:
-        if not _distributed_is_active(process_group):
-            return None
-
+    ) -> "_SharedCpuStore":
+        _require_process_group(process_group)
         cls._validate_same_host(process_group)
         rank = _rank(process_group)
         created_by_engine = requested_dir is None
@@ -839,8 +735,7 @@ class _SharedCpuStore:
         return f"{digest}.bin"
 
     def barrier(self) -> None:
-        if _distributed_is_active(self.process_group):
-            dist.barrier(group=self.process_group)
+        dist.barrier(group=self.process_group)
 
     def tensor_like(self, key: str, like: Tensor) -> Tensor:
         reference = like.detach()
@@ -974,24 +869,10 @@ class _PrefetchedState:
 
 
 @dataclass
-class _PendingGradCopy:
-    tensor: Tensor
-    event: Optional[torch.cuda.Event]
-
-
-@dataclass
 class _PrefetchedOptimizerStep:
     named_parameters: List[Tuple[str, nn.Parameter]]
     staged_parameters: List[nn.Parameter]
     optimizer: Optional[torch.optim.Optimizer]
-    event: Optional[torch.cuda.Event]
-
-
-@dataclass
-class _PendingOptimizerCommit:
-    parameter_copies: List[Tuple[nn.Parameter, Tensor]]
-    optimizer_state: Optional[Dict[str, Dict[str, Any]]]
-    device_refs: List[Any]
     event: Optional[torch.cuda.Event]
 
 
@@ -1016,10 +897,8 @@ class _OffloadedModuleHandle:
         metrics: StreamingTransferMetrics,
         grad_norm_type: float,
         track_grad_norms: bool,
-        eager_pin_cpu_masters: bool,
-        lazy_pin_cpu_transfers: bool,
-        pinned_transfer_buffer: Optional[_PinnedTransferBuffer],
-        shared_cpu_store: Optional[_SharedCpuStore],
+        pinned_transfer_buffer: _PinnedTransferBuffer,
+        shared_cpu_store: _SharedCpuStore,
     ) -> None:
         self.qualified_name = qualified_name
         self.stage_index = int(stage_index)
@@ -1029,7 +908,6 @@ class _OffloadedModuleHandle:
         self.metrics = metrics
         self.grad_norm_type = float(grad_norm_type)
         self.track_grad_norms = bool(track_grad_norms)
-        self.lazy_pin_cpu_transfers = bool(lazy_pin_cpu_transfers)
         self.pinned_transfer_buffer = pinned_transfer_buffer
         self.shared_cpu_store = shared_cpu_store
         # The transformation replaces the original container in-place, so the
@@ -1037,11 +915,8 @@ class _OffloadedModuleHandle:
         # distributed shared-CPU mode, do not call module.cpu() here: ranks that
         # do not initialize the shared tensors would briefly materialize a full
         # private CPU copy only to replace it with file-backed storage below.
-        self.module = module if self.shared_cpu_store is not None else module.cpu()
-        if self.shared_cpu_store is not None:
-            self._share_module_cpu_state_()
-        if self.shared_cpu_store is None and eager_pin_cpu_masters and self.local_device.type == "cuda":
-            _pin_module_cpu_tensors_if_possible_(self.module)
+        self.module = module
+        self._share_module_cpu_state_()
         self.param_names = [name for name, _ in self.module.named_parameters(recurse=True)]
         self.buffer_names = [name for name, _ in self.module.named_buffers(recurse=True)]
         self.optimizer_state: Dict[str, Dict[str, Any]] = {}
@@ -1049,16 +924,8 @@ class _OffloadedModuleHandle:
         self._prefetched: Optional[_PrefetchedState] = None
         self._prefetch_streams: Dict[Tuple[int, bool], torch.cuda.Stream] = {}
         self._optimizer_prefetch_streams: Dict[int, torch.cuda.Stream] = {}
-        self._optimizer_commit_streams: Dict[int, torch.cuda.Stream] = {}
         self._prefetched_optimizer_step: Optional[_PrefetchedOptimizerStep] = None
-        self._pending_optimizer_commit: Optional[_PendingOptimizerCommit] = None
-        self._pending_grad_copies: Dict[str, List[_PendingGradCopy]] = {}
-        self._grad_copy_events: Dict[str, torch.cuda.Event] = {}
         self._grad_norms_by_name: Dict[str, Tensor] = {}
-
-    @property
-    def uses_shared_cpu(self) -> bool:
-        return self.shared_cpu_store is not None
 
     def _shared_key(self, *parts: str) -> str:
         return ".".join((self.qualified_name, *parts))
@@ -1067,8 +934,6 @@ class _OffloadedModuleHandle:
         return self._shared_key("local_gradient", str(_rank(self.process_group)), name)
 
     def _copy_to_shared_gradient(self, name: str, source: Tensor, *, kind: str) -> Tensor:
-        if self.shared_cpu_store is None:
-            raise RuntimeError("shared gradient storage requested without a shared CPU store")
         shared = self.shared_cpu_store.tensor_like(self._shared_key("gradient", name), source.detach())
         byte_count = _tensor_nbytes(source)
 
@@ -1081,8 +946,6 @@ class _OffloadedModuleHandle:
         return self.metrics.record_copy(kind, byte_count, source.device, copy_fn)
 
     def _copy_to_local_shared_gradient(self, name: str, source: Tensor, *, kind: str) -> Tensor:
-        if self.shared_cpu_store is None:
-            raise RuntimeError("local shared gradient storage requested without a shared CPU store")
         shared = self.shared_cpu_store.tensor_like(self._local_gradient_key(name), source.detach())
         byte_count = _tensor_nbytes(source)
 
@@ -1095,20 +958,14 @@ class _OffloadedModuleHandle:
         return self.metrics.record_copy(kind, byte_count, source.device, copy_fn)
 
     def _release_shared_gradients(self, names: Iterable[str]) -> None:
-        if self.shared_cpu_store is None:
-            return
         for name in names:
             self.shared_cpu_store.release_tensor(self._shared_key("gradient", name))
 
     def _release_local_shared_gradients(self, names: Iterable[str]) -> None:
-        if self.shared_cpu_store is None:
-            return
         for name in names:
             self.shared_cpu_store.release_tensor(self._local_gradient_key(name))
 
     def _share_module_cpu_state_(self) -> None:
-        if self.shared_cpu_store is None:
-            return
         initialize = _rank(self.process_group) == 0
         for name, parameter in self.module.named_parameters(recurse=True):
             shared = self.shared_cpu_store.copy_tensor(
@@ -1138,8 +995,6 @@ class _OffloadedModuleHandle:
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         self.wait_optimizer_commit()
-        self._wait_all_grad_copies()
-        self._discard_pending_grad_copies()
         self._grad_norms_by_name = {}
         if set_to_none:
             self._release_shared_gradients(self.parameters_by_name.keys())
@@ -1152,24 +1007,6 @@ class _OffloadedModuleHandle:
             else:
                 parameter.grad.zero_()
 
-    def _record_grad_copy(self, name: str, device: torch.device) -> None:
-        if device.type != "cuda":
-            return
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(device))
-        self._grad_copy_events[name] = event
-
-    def _wait_grad_copy(self, name: str) -> None:
-        event = self._grad_copy_events.pop(name, None)
-        if event is not None:
-            event.synchronize()
-
-    def _wait_all_grad_copies(self) -> None:
-        events = list(self._grad_copy_events.values())
-        self._grad_copy_events = {}
-        for event in events:
-            event.synchronize()
-
     def _record_grad_norm(self, name: str, grad: Tensor, *, norm_type: float) -> None:
         if not self.track_grad_norms:
             return
@@ -1179,14 +1016,6 @@ class _OffloadedModuleHandle:
         else:
             self._grad_norms_by_name[name] = torch.linalg.vector_norm(detached, ord=norm_type)
 
-    def broadcast_initial_state(self) -> None:
-        """Make hidden CPU masters identical across ranks after random init."""
-
-        for parameter in self.parameters_by_name.values():
-            _broadcast_tensor_(parameter.data, src=0, local_device=self.local_device, process_group=self.process_group)
-        for buffer in self.buffers_by_name.values():
-            _broadcast_tensor_(buffer.data, src=0, local_device=self.local_device, process_group=self.process_group)
-
     def _state_for_call(self, device: torch.device, requires_grad: bool) -> "OrderedDict[str, Tensor]":
         state: "OrderedDict[str, Tensor]" = OrderedDict()
         for name, parameter in self.parameters_by_name.items():
@@ -1195,7 +1024,6 @@ class _OffloadedModuleHandle:
                 device,
                 metrics=self.metrics,
                 kind="state_h2d",
-                pin_source=self.lazy_pin_cpu_transfers,
                 pinned_transfer_buffer=self.pinned_transfer_buffer,
             )
             if requires_grad and parameter.requires_grad:
@@ -1207,7 +1035,6 @@ class _OffloadedModuleHandle:
                 device,
                 metrics=self.metrics,
                 kind="state_h2d",
-                pin_source=self.lazy_pin_cpu_transfers,
                 pinned_transfer_buffer=self.pinned_transfer_buffer,
             )
         return state
@@ -1231,16 +1058,6 @@ class _OffloadedModuleHandle:
         if stream is None:
             stream = torch.cuda.Stream(device=device)
             self._optimizer_prefetch_streams[int(index)] = stream
-        return stream
-
-    def _optimizer_commit_stream(self, device: torch.device) -> torch.cuda.Stream:
-        index = device.index
-        if index is None:
-            index = torch.cuda.current_device()
-        stream = self._optimizer_commit_streams.get(int(index))
-        if stream is None:
-            stream = torch.cuda.Stream(device=device)
-            self._optimizer_commit_streams[int(index)] = stream
         return stream
 
     def clear_prefetch(self) -> None:
@@ -1321,19 +1138,16 @@ class _OffloadedModuleHandle:
                         optimizer_device,
                         metrics=self.metrics,
                         kind="optimizer_param_h2d",
-                        pin_source=self.lazy_pin_cpu_transfers,
                         pinned_transfer_buffer=self.pinned_transfer_buffer,
                     ),
                     requires_grad=cpu_parameter.requires_grad,
                 )
                 if cpu_parameter.grad is not None:
-                    self._wait_grad_copy(name)
                     staged.grad = _copy_tensor_to_device(
                         cpu_parameter.grad.detach(),
                         optimizer_device,
                         metrics=self.metrics,
                         kind="optimizer_grad_h2d",
-                        pin_source=self.lazy_pin_cpu_transfers,
                         pinned_transfer_buffer=self.pinned_transfer_buffer,
                     )
                     if clip_coef is not None:
@@ -1348,7 +1162,6 @@ class _OffloadedModuleHandle:
                         saved_state,
                         optimizer_device,
                         metrics=self.metrics,
-                        pin_source=self.lazy_pin_cpu_transfers,
                         pinned_transfer_buffer=self.pinned_transfer_buffer,
                     )
             event = torch.cuda.Event()
@@ -1406,66 +1219,26 @@ class _OffloadedModuleHandle:
         staged_parameters: List[nn.Parameter],
         optimizer: Optional[torch.optim.Optimizer],
         optimizer_device: torch.device,
-        async_commit: bool,
     ) -> None:
-        if optimizer_device.type != "cuda" or not async_commit:
-            for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
+        del optimizer_device
+        for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
+            byte_count = _tensor_nbytes(staged)
+
+            def copy_parameter() -> Tensor:
                 cpu_parameter.data.copy_(staged.detach(), non_blocking=False)
-                if optimizer is not None and staged in optimizer.state:
-                    self.optimizer_state[name] = _Tree.detach_cpu(
+                return cpu_parameter.data
+
+            self.metrics.record_copy("optimizer_param_d2h", byte_count, staged.device, copy_parameter)
+            if optimizer is not None and staged in optimizer.state:
+                self.optimizer_state[name] = _Tree.detach_cpu(
                         optimizer.state[staged],
                         metrics=self.metrics,
-                        pin_memory=False,
                         shared_cpu_store=self.shared_cpu_store,
                         shared_key=self._shared_key("optimizer", name),
-                    )
-            return
-
-        stream = self._optimizer_commit_stream(optimizer_device)
-        stream.wait_stream(torch.cuda.current_stream(optimizer_device))
-        parameter_copies: List[Tuple[nn.Parameter, Tensor]] = []
-        optimizer_state: Dict[str, Dict[str, Any]] = {}
-        with torch.cuda.stream(stream):
-            for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
-                copied = _copy_tensor_to_cpu(
-                    staged.detach(),
-                    metrics=self.metrics,
-                    kind="optimizer_param_d2h",
-                    pin_memory=True,
                 )
-                parameter_copies.append((cpu_parameter, copied))
-                if optimizer is not None and staged in optimizer.state:
-                    optimizer_state[name] = _Tree.detach_cpu(
-                        optimizer.state[staged],
-                        metrics=self.metrics,
-                        pin_memory=True,
-                        shared_cpu_store=self.shared_cpu_store,
-                        shared_key=self._shared_key("optimizer", name),
-                    )
-            event = torch.cuda.Event()
-            event.record(stream)
-
-        with self._lock:
-            self._pending_optimizer_commit = _PendingOptimizerCommit(
-                parameter_copies=parameter_copies,
-                optimizer_state=optimizer_state,
-                device_refs=[staged_parameters, optimizer],
-                event=event,
-            )
 
     def wait_optimizer_commit(self) -> None:
-        with self._lock:
-            pending = self._pending_optimizer_commit
-            self._pending_optimizer_commit = None
-        if pending is None:
-            return
-        if pending.event is not None:
-            pending.event.synchronize()
-        for cpu_parameter, copied in pending.parameter_copies:
-            cpu_parameter.data = _Tree.detach_pageable_cpu(copied)
-        if pending.optimizer_state is not None:
-            self.optimizer_state = _Tree.detach_pageable_cpu(pending.optimizer_state)
-        pending.device_refs.clear()
+        return
 
     def forward_on_device(self, args: Tuple[Any, ...], kwargs: Mapping[str, Any], device: torch.device) -> Any:
         state = self._consume_state(device=device, requires_grad=False)
@@ -1496,101 +1269,56 @@ class _OffloadedModuleHandle:
                     if target.grad is None:
                         accumulated = grad_detached
                     else:
-                        self._wait_grad_copy(name)
                         accumulated = _copy_tensor_to_device(
                             target.grad.detach(),
                             grad_detached.device,
                             metrics=self.metrics,
                             kind="grad_accum_h2d",
-                            pin_source=self.lazy_pin_cpu_transfers,
                             pinned_transfer_buffer=self.pinned_transfer_buffer,
                         )
                         accumulated.add_(grad_detached)
                     self._record_grad_norm(name, accumulated, norm_type=self.grad_norm_type)
-                    if self.uses_shared_cpu:
-                        target.grad = self._copy_to_local_shared_gradient(name, accumulated, kind="grad_d2h")
-                    else:
-                        target.grad = _copy_tensor_to_cpu(accumulated, metrics=self.metrics, kind="grad_d2h", like=target)
-                        self._record_grad_copy(name, grad_detached.device)
+                    target.grad = self._copy_to_local_shared_gradient(name, accumulated, kind="grad_d2h")
                 elif target.grad is None:
                     target.grad = grad.detach().clone()
                 else:
                     target.grad.add_(grad.detach())
 
-    def _discard_pending_grad_copies(self) -> None:
-        with self._lock:
-            pending = self._pending_grad_copies
-            self._pending_grad_copies = {}
-        for copies in pending.values():
-            for pending_copy in copies:
-                if pending_copy.event is not None:
-                    pending_copy.event.synchronize()
-
-    def flush_pending_gradients(self) -> None:
-        with self._lock:
-            pending = self._pending_grad_copies
-            self._pending_grad_copies = {}
-        if not pending:
-            return
-        parameters = self.parameters_by_name
-        for name, copies in pending.items():
-            target = parameters[name]
-            for pending_copy in copies:
-                if pending_copy.event is not None:
-                    pending_copy.event.synchronize()
-                if target.grad is None:
-                    target.grad = pending_copy.tensor
-                else:
-                    target.grad.add_(pending_copy.tensor)
-
     def synchronize_gradients(self) -> None:
         """Average accumulated offloaded gradients across torchrun ranks."""
 
         if self.local_device.type == "cuda":
-            if _distributed_is_active(self.process_group):
-                for name, parameter in self.parameters_by_name.items():
-                    if parameter.grad is None:
-                        continue
-                    self._wait_grad_copy(name)
-                    staged_grad = _copy_tensor_to_device(
-                        parameter.grad.detach(),
-                        self.local_device,
-                        metrics=self.metrics,
-                        kind="grad_reduce_h2d",
-                        pin_source=self.lazy_pin_cpu_transfers,
-                        pinned_transfer_buffer=self.pinned_transfer_buffer,
-                    )
-                    reduced = _all_reduce_mean_(staged_grad, self.local_device, self.process_group).detach()
-                    self._record_grad_norm(name, reduced, norm_type=self.grad_norm_type)
-                    if self.uses_shared_cpu:
-                        if _rank(self.process_group) == self.owner_rank:
-                            parameter.grad = self._copy_to_shared_gradient(name, reduced, kind="grad_reduce_d2h")
-                        else:
-                            parameter.grad = None
-                        self._release_local_shared_gradients((name,))
-                    else:
-                        parameter.grad = _copy_tensor_to_cpu(reduced, metrics=self.metrics, kind="grad_reduce_d2h", like=parameter)
-                        self._record_grad_copy(name, self.local_device)
+            for name, parameter in self.parameters_by_name.items():
+                if parameter.grad is None:
+                    continue
+                staged_grad = _copy_tensor_to_device(
+                    parameter.grad.detach(),
+                    self.local_device,
+                    metrics=self.metrics,
+                    kind="grad_reduce_h2d",
+                    pinned_transfer_buffer=self.pinned_transfer_buffer,
+                )
+                reduced = _all_reduce_mean_(staged_grad, self.local_device, self.process_group).detach()
+                self._record_grad_norm(name, reduced, norm_type=self.grad_norm_type)
+                if _rank(self.process_group) == self.owner_rank:
+                    parameter.grad = self._copy_to_shared_gradient(name, reduced, kind="grad_reduce_d2h")
+                else:
+                    parameter.grad = None
+                self._release_local_shared_gradients((name,))
             return
 
-        self.flush_pending_gradients()
-        if not _distributed_is_active(self.process_group):
-            return
         for name, parameter in self.parameters_by_name.items():
             if parameter.grad is None:
                 continue
             reduced = _all_reduce_mean_(parameter.grad, self.local_device, self.process_group).detach().cpu()
             self._record_grad_norm(name, reduced, norm_type=self.grad_norm_type)
-            if self.uses_shared_cpu:
-                if _rank(self.process_group) == self.owner_rank:
-                    parameter.grad = self._copy_to_shared_gradient(name, reduced, kind="grad_reduce_d2h")
-                else:
-                    parameter.grad = None
+            if _rank(self.process_group) == self.owner_rank:
+                parameter.grad = self._copy_to_shared_gradient(name, reduced, kind="grad_reduce_d2h")
             else:
-                parameter.grad = reduced
+                parameter.grad = None
 
     def offloaded_grad_norm(self, *, device: torch.device, norm_type: float) -> Optional[Tensor]:
-        if self.uses_shared_cpu and norm_type == self.grad_norm_type:
+        if norm_type == self.grad_norm_type:
             cached_norms: List[Tensor] = []
             for name, parameter in self.parameters_by_name.items():
                 if parameter.grad is None and name not in self._grad_norms_by_name:
@@ -1618,14 +1346,12 @@ class _OffloadedModuleHandle:
         for name, parameter in self.parameters_by_name.items():
             if parameter.grad is None:
                 continue
-            self._wait_grad_copy(name)
             staged_grads.append(
                 _copy_tensor_to_device(
                     parameter.grad.detach(),
                     device,
                     metrics=self.metrics,
                     kind="grad_norm_h2d",
-                    pin_source=self.lazy_pin_cpu_transfers,
                     pinned_transfer_buffer=self.pinned_transfer_buffer,
                 )
             )
@@ -1651,7 +1377,6 @@ class _OffloadedModuleHandle:
         optimizer_kwargs: Mapping[str, Any],
         optimizer_device: torch.device,
         clip_coef: Optional[Tensor],
-        async_commit: bool = True,
     ) -> None:
         """Run a PyTorch optimizer for this stage on its owner rank.
 
@@ -1663,8 +1388,6 @@ class _OffloadedModuleHandle:
         """
 
         self.clear_prefetch()
-        if self.local_device.type != "cuda":
-            self.flush_pending_gradients()
         named_parameters = list(self.parameters_by_name.items())
         if not named_parameters:
             return
@@ -1681,7 +1404,6 @@ class _OffloadedModuleHandle:
                             optimizer_device,
                             metrics=self.metrics,
                             kind="optimizer_param_h2d",
-                            pin_source=self.lazy_pin_cpu_transfers,
                             pinned_transfer_buffer=self.pinned_transfer_buffer,
                         ),
                         requires_grad=cpu_parameter.requires_grad,
@@ -1692,7 +1414,6 @@ class _OffloadedModuleHandle:
                             optimizer_device,
                             metrics=self.metrics,
                             kind="optimizer_grad_h2d",
-                            pin_source=self.lazy_pin_cpu_transfers,
                             pinned_transfer_buffer=self.pinned_transfer_buffer,
                         )
                     staged_parameters.append(staged)
@@ -1705,7 +1426,6 @@ class _OffloadedModuleHandle:
                             saved_state,
                             optimizer_device,
                             metrics=self.metrics,
-                            pin_source=self.lazy_pin_cpu_transfers,
                             pinned_transfer_buffer=self.pinned_transfer_buffer,
                         )
                 optimizer.step()
@@ -1715,22 +1435,14 @@ class _OffloadedModuleHandle:
                         self.optimizer_state[name] = _Tree.detach_cpu(
                             optimizer.state[staged],
                             metrics=self.metrics,
-                            pin_memory=False,
                             shared_cpu_store=self.shared_cpu_store,
                             shared_key=self._shared_key("optimizer", name),
                         )
 
-            if self.uses_shared_cpu:
-                for _, cpu_parameter in named_parameters:
-                    cpu_parameter.grad = None
-                if _distributed_is_active(self.process_group):
-                    dist.barrier(group=self.process_group)
-                self._release_shared_gradients(name for name, _ in named_parameters)
-                return
-
-            for name, cpu_parameter in named_parameters:
-                _broadcast_tensor_(cpu_parameter.data, src=owner, local_device=self.local_device, process_group=self.process_group)
+            for _, cpu_parameter in named_parameters:
                 cpu_parameter.grad = None
+            dist.barrier(group=self.process_group)
+            self._release_shared_gradients(name for name, _ in named_parameters)
             return
 
         rank = _rank(self.process_group)
@@ -1751,51 +1463,21 @@ class _OffloadedModuleHandle:
                 raise RuntimeError("owner rank is missing prefetched optimizer")
 
             optimizer.step()
-        elif self.uses_shared_cpu:
+        else:
             staged_parameters = []
             optimizer = None
-        else:
-            staged_parameters = [
-                nn.Parameter(
-                    torch.empty_like(cpu_parameter, device=self.local_device),
-                    requires_grad=cpu_parameter.requires_grad,
-                )
-                for _, cpu_parameter in named_parameters
-            ]
-            optimizer = None
 
-        if self.uses_shared_cpu:
-            if rank == owner:
-                self._schedule_optimizer_commit(
-                    named_parameters=named_parameters,
-                    staged_parameters=staged_parameters,
-                    optimizer=optimizer,
-                    optimizer_device=optimizer_device,
-                    async_commit=False,
-                )
-            for name, cpu_parameter in named_parameters:
-                self._wait_grad_copy(name)
-                cpu_parameter.grad = None
-            if _distributed_is_active(self.process_group):
-                dist.barrier(group=self.process_group)
-            self._release_shared_gradients(name for name, _ in named_parameters)
-            del optimizer, staged_parameters
-            self.evict_device(optimizer_device)
-            return
-
-        for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
-            self._wait_grad_copy(name)
-            _broadcast_tensor_(staged.data, src=owner, local_device=self.local_device, process_group=self.process_group)
+        if rank == owner:
+            self._schedule_optimizer_commit(
+                named_parameters=named_parameters,
+                staged_parameters=staged_parameters,
+                optimizer=optimizer,
+                optimizer_device=optimizer_device,
+            )
+        for name, cpu_parameter in named_parameters:
             cpu_parameter.grad = None
-
-        self._schedule_optimizer_commit(
-            named_parameters=named_parameters,
-            staged_parameters=staged_parameters,
-            optimizer=optimizer,
-            optimizer_device=optimizer_device,
-            async_commit=async_commit,
-        )
-
+        dist.barrier(group=self.process_group)
+        self._release_shared_gradients(name for name, _ in named_parameters)
         del optimizer, staged_parameters
         self.evict_device(optimizer_device)
 
@@ -2133,11 +1815,10 @@ class CPUStreamingEngine:
         grad_norm_type: float,
         error_if_nonfinite: bool,
         process_group: Optional[Any],
-        wrap_ddp: bool,
         ddp_kwargs: Mapping[str, Any],
         close_rank: int,
         metrics: StreamingTransferMetrics,
-        shared_cpu_store: Optional[_SharedCpuStore],
+        shared_cpu_store: _SharedCpuStore,
     ) -> None:
         self.root_model = root_model
         self.module_path = module_path
@@ -2154,36 +1835,28 @@ class CPUStreamingEngine:
         self.transfer_metrics = metrics
         self.shared_cpu_store = shared_cpu_store
         self.optimizer_prefetch_enabled = _env_flag("DTAI_PARALLEL_OPTIMIZER_PREFETCH", default=True)
-        self.optimizer_async_commit_enabled = _env_flag("DTAI_PARALLEL_OPTIMIZER_ASYNC_COMMIT", default=True)
         self._closed = False
 
         self.handles = list(streaming_container.offloaded_handles())
-        if self.shared_cpu_store is not None:
-            self.shared_cpu_store.barrier()
-        for handle in self.handles:
-            if not handle.uses_shared_cpu:
-                handle.broadcast_initial_state()
+        self.shared_cpu_store.barrier()
 
         # Only resident parameters are registered in the module tree.  Offloaded
         # CPU masters live in hidden handles, so moving the root model cannot move
         # them off CPU.
         self.root_model.to(self.local_device)
 
-        self.ddp_enabled = bool(wrap_ddp and _distributed_is_active(process_group))
-        if self.ddp_enabled:
-            kwargs = dict(ddp_kwargs)
-            if self.local_device.type == "cuda":
-                index = self.local_device.index
-                if index is None:
-                    index = torch.cuda.current_device()
-                kwargs.setdefault("device_ids", [index])
-                kwargs.setdefault("output_device", index)
-            else:
-                kwargs.setdefault("device_ids", None)
-            kwargs.setdefault("process_group", process_group)
-            self.model: nn.Module = DDP(self.root_model, **kwargs)
+        kwargs = dict(ddp_kwargs)
+        if self.local_device.type == "cuda":
+            index = self.local_device.index
+            if index is None:
+                index = torch.cuda.current_device()
+            kwargs.setdefault("device_ids", [index])
+            kwargs.setdefault("output_device", index)
         else:
-            self.model = self.root_model
+            kwargs.setdefault("device_ids", None)
+        kwargs.setdefault("process_group", process_group)
+        self.model: nn.Module = DDP(self.root_model, **kwargs)
+        self.ddp_enabled = True
 
         resident_parameters = [p for p in self.model.parameters() if p.requires_grad]
         self.resident_optimizer: Optional[torch.optim.Optimizer]
@@ -2202,7 +1875,7 @@ class CPUStreamingEngine:
             ddp_enabled=self.ddp_enabled,
             world_size=_world_size(process_group),
             rank=_rank(process_group),
-            shared_cpu_dir=self.shared_cpu_store.directory if self.shared_cpu_store is not None else None,
+            shared_cpu_dir=self.shared_cpu_store.directory,
         )
 
     def zero_grad(self, set_to_none: bool = True) -> None:
@@ -2215,15 +1888,6 @@ class CPUStreamingEngine:
             self.model.zero_grad(set_to_none=set_to_none)
         for handle in self.handles:
             handle.zero_grad(set_to_none=set_to_none)
-
-    def _parameters_for_clipping(self) -> List[nn.Parameter]:
-        params: List[nn.Parameter] = []
-        for handle in self.handles:
-            params.extend(handle.parameters_by_name.values())
-        if self.resident_optimizer is not None:
-            for group in self.resident_optimizer.param_groups:
-                params.extend(group["params"])
-        return [parameter for parameter in params if parameter.requires_grad]
 
     def _cuda_total_grad_norm(self) -> Tensor:
         norms: List[Optional[Tensor]] = []
@@ -2262,24 +1926,15 @@ class CPUStreamingEngine:
         total_norm: Optional[Tensor]
         cuda_clip_coef: Optional[Tensor] = None
         if self.max_grad_norm is not None:
-            if self.local_device.type == "cuda" or self.shared_cpu_store is not None:
-                total_norm = self._cuda_total_grad_norm()
-                cuda_clip_coef = _clip_coef(
-                    total_norm,
-                    max_norm=float(self.max_grad_norm),
-                    error_if_nonfinite=self.error_if_nonfinite,
-                )
-                self._scale_resident_gradients_(cuda_clip_coef)
-                if self.local_device.type != "cuda":
-                    self._scale_offloaded_gradients_(cuda_clip_coef)
-            else:
-                total_norm = clip_grad_norm_(
-                    self._parameters_for_clipping(),
-                    max_norm=float(self.max_grad_norm),
-                    norm_type=self.grad_norm_type,
-                    error_if_nonfinite=self.error_if_nonfinite,
-                    foreach=False,
-                )
+            total_norm = self._cuda_total_grad_norm()
+            cuda_clip_coef = _clip_coef(
+                total_norm,
+                max_norm=float(self.max_grad_norm),
+                error_if_nonfinite=self.error_if_nonfinite,
+            )
+            self._scale_resident_gradients_(cuda_clip_coef)
+            if self.local_device.type != "cuda":
+                self._scale_offloaded_gradients_(cuda_clip_coef)
         else:
             total_norm = None
 
@@ -2309,7 +1964,6 @@ class CPUStreamingEngine:
                 optimizer_kwargs=self.optimizer_kwargs,
                 optimizer_device=self.optimizer_device,
                 clip_coef=cuda_clip_coef,
-                async_commit=self.optimizer_async_commit_enabled and self.shared_cpu_store is None,
             )
             if index > 0:
                 self.handles[index - 1].wait_optimizer_commit()
@@ -2369,8 +2023,7 @@ class CPUStreamingEngine:
 
         if self._closed:
             return None
-        if _distributed_is_active(self.process_group):
-            dist.barrier(group=self.process_group)
+        dist.barrier(group=self.process_group)
         for handle in self.handles:
             handle.evict_device(self.local_device)
         self._closed = True
@@ -2381,12 +2034,9 @@ class CPUStreamingEngine:
             target = torch.device(device) if device is not None else self.local_device
             result = self.materialize(target)
 
-        if _distributed_is_active(self.process_group):
-            dist.barrier(group=self.process_group)
-        if self.shared_cpu_store is not None:
-            self.shared_cpu_store.cleanup()
-        if _distributed_is_active(self.process_group):
-            dist.barrier(group=self.process_group)
+        dist.barrier(group=self.process_group)
+        self.shared_cpu_store.cleanup()
+        dist.barrier(group=self.process_group)
         return result
 
 
@@ -2401,10 +2051,8 @@ def _build_streaming_container(
     metrics: StreamingTransferMetrics,
     grad_norm_type: float,
     track_grad_norms: bool,
-    eager_pin_cpu_masters: bool,
-    lazy_pin_cpu_transfers: bool,
-    pinned_transfer_buffer: Optional[_PinnedTransferBuffer],
-    shared_cpu_store: Optional[_SharedCpuStore],
+    pinned_transfer_buffer: _PinnedTransferBuffer,
+    shared_cpu_store: _SharedCpuStore,
 ) -> Union[CPUStreamingModuleList, CPUStreamingSequential]:
     if not isinstance(container, (nn.ModuleList, nn.Sequential)):
         raise TypeError(
@@ -2437,8 +2085,6 @@ def _build_streaming_container(
                 metrics=metrics,
                 grad_norm_type=grad_norm_type,
                 track_grad_norms=track_grad_norms,
-                eager_pin_cpu_masters=eager_pin_cpu_masters,
-                lazy_pin_cpu_transfers=lazy_pin_cpu_transfers,
                 pinned_transfer_buffer=pinned_transfer_buffer,
                 shared_cpu_store=shared_cpu_store,
             )
@@ -2476,12 +2122,9 @@ def apply_cpu_streaming_(
     device: Optional[DeviceLike] = None,
     optimizer_device: Optional[DeviceLike] = None,
     process_group: Optional[Any] = None,
-    auto_init_process_group: bool = True,
-    wrap_ddp: bool = True,
     ddp_kwargs: Optional[Mapping[str, Any]] = None,
     close_rank: int = 0,
     collect_timing: Optional[bool] = None,
-    pin_cpu_masters: PinCpuMasters = True,
     shared_cpu_dir: Optional[str] = None,
 ) -> CPUStreamingEngine:
     """Transform ``model.<module_path>`` in place and return a training engine.
@@ -2514,26 +2157,18 @@ def apply_cpu_streaming_(
     device:
         The single local device for this torchrun process.  If omitted, CUDA uses
         ``LOCAL_RANK`` when available; CPU is used otherwise.
-    wrap_ddp:
-        When true and a distributed process group has world size greater than
-        one, the transformed model is wrapped in ``DistributedDataParallel`` for
-        all resident parameters.  The DDP-wrapped model is available as
-        ``engine.model``.
+    ddp_kwargs:
+        Optional keyword arguments for the ``DistributedDataParallel`` wrapper
+        used for resident parameters.
     collect_timing:
         When true, collect per-transfer enqueue time, byte counts, and CUDA event
         durations.  If omitted, ``DTAI_PARALLEL_TIMING=1`` enables collection.
-    pin_cpu_masters:
-        ``True`` or ``"eager"`` pins hidden CPU master tensors during setup for
-        faster CUDA transfers. ``"lazy"`` pins each CPU source tensor immediately
-        before transfer, avoiding setup-time pinned-memory spikes. ``False``
-        disables pinning.
     shared_cpu_dir:
-        Optional directory for distributed offloaded CPU state.  When a
-        distributed process group is active, offloaded CPU weights, gradients,
-        and optimizer-state tensors are always file-backed shared memory.  This
-        directory must resolve under ``/dev/shm``.  If omitted, rank 0 creates a
-        temporary directory under ``/dev/shm`` and broadcasts it to the other
-        same-host ranks.
+        Optional directory for offloaded CPU state.  Offloaded CPU weights,
+        gradients, and optimizer-state tensors are always file-backed shared
+        memory.  This directory must resolve under ``/dev/shm``.  If omitted,
+        rank 0 creates a temporary directory under ``/dev/shm`` and broadcasts it
+        to the other same-host ranks.
 
     Returns
     -------
@@ -2543,12 +2178,11 @@ def apply_cpu_streaming_(
     """
 
     local_device = _normalize_device(device) if device is not None else _infer_local_device()
-    _maybe_auto_init_process_group(auto_init_process_group, local_device)
+    _init_process_group_from_torchrun(local_device)
     if collect_timing is None:
         collect_timing = os.environ.get("DTAI_PARALLEL_TIMING", "").lower() in {"1", "true", "yes", "on"}
     metrics = StreamingTransferMetrics(enabled=bool(collect_timing))
-    eager_pin_cpu_masters, lazy_pin_cpu_transfers = _normalize_pin_cpu_masters(pin_cpu_masters)
-    pinned_transfer_buffer = _PinnedTransferBuffer() if lazy_pin_cpu_transfers else None
+    pinned_transfer_buffer = _PinnedTransferBuffer()
     shared_cpu_store = _SharedCpuStore.create(requested_dir=shared_cpu_dir, process_group=process_group)
 
     parent, child_name, target = _resolve_module_path(model, module_path)
@@ -2562,8 +2196,6 @@ def apply_cpu_streaming_(
         metrics=metrics,
         grad_norm_type=grad_norm_type,
         track_grad_norms=max_grad_norm is not None,
-        eager_pin_cpu_masters=eager_pin_cpu_masters,
-        lazy_pin_cpu_transfers=lazy_pin_cpu_transfers,
         pinned_transfer_buffer=pinned_transfer_buffer,
         shared_cpu_store=shared_cpu_store,
     )
@@ -2581,7 +2213,6 @@ def apply_cpu_streaming_(
         grad_norm_type=grad_norm_type,
         error_if_nonfinite=error_if_nonfinite,
         process_group=process_group,
-        wrap_ddp=wrap_ddp,
         ddp_kwargs=dict(ddp_kwargs or {}),
         close_rank=close_rank,
         metrics=metrics,

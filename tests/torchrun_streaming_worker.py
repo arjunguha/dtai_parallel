@@ -49,9 +49,14 @@ def _device() -> torch.device:
 
 
 def _init_distributed_if_needed() -> None:
-    """Initialize NCCL only for worker cases launched with multiple ranks."""
-    if _world_size() > 1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+    """Initialize NCCL for torchrun worker cases that need collectives."""
+    if not dist.is_initialized():
+        device = torch.device("cuda", _local_rank())
+        torch.cuda.set_device(device)
+        try:
+            dist.init_process_group(backend="nccl", device_id=device)
+        except TypeError:
+            dist.init_process_group(backend="nccl")
 
 
 def _destroy_distributed_if_needed() -> None:
@@ -83,8 +88,6 @@ def _streaming_ddp_state(
             optimizer_kwargs=optimizer_kwargs_for("adamw"),
             max_grad_norm=max_grad_norm,
             device=device,
-            auto_init_process_group=False,
-            wrap_ddp=True,
         )
         assert isinstance(engine.model, DDP)
         criterion = nn.MSELoss()
@@ -190,32 +193,34 @@ def run_single_gpu_streaming_state(
     container_kind: str,
     optimizer_name: str,
     max_grad_norm: Optional[float],
-    pin_cpu_masters=True,
     resident_suffix_count: int = 0,
 ) -> None:
     """Write streamed one-GPU training state for pytest-side comparison."""
     if _rank() != 0:
         return
-    dtype = torch.float32
-    device = _device()
-    torch.manual_seed(20260610)
-    initial_model, module_path = _single_gpu_model_and_path(container_kind, dtype)
-    xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
-    state = train_single_process_streaming(
-        initial_model,
-        module_path,
-        xs_cpu,
-        ys_cpu,
-        offload_policy=True if resident_suffix_count else [True, False, True],
-        optimizer_name=optimizer_name,
-        optimizer_kwargs=optimizer_kwargs_for(optimizer_name),
-        max_grad_norm=max_grad_norm,
-        steps=2,
-        device=device,
-        pin_cpu_masters=pin_cpu_masters,
-        resident_suffix_count=resident_suffix_count,
-    ).state_dict()
-    torch.save({key: value.detach().cpu() for key, value in state.items()}, result_file)
+    _init_distributed_if_needed()
+    try:
+        dtype = torch.float32
+        device = _device()
+        torch.manual_seed(20260610)
+        initial_model, module_path = _single_gpu_model_and_path(container_kind, dtype)
+        xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
+        state = train_single_process_streaming(
+            initial_model,
+            module_path,
+            xs_cpu,
+            ys_cpu,
+            offload_policy=True if resident_suffix_count else [True, False, True],
+            optimizer_name=optimizer_name,
+            optimizer_kwargs=optimizer_kwargs_for(optimizer_name),
+            max_grad_norm=max_grad_norm,
+            steps=2,
+            device=device,
+            resident_suffix_count=resident_suffix_count,
+        ).state_dict()
+        torch.save({key: value.detach().cpu() for key, value in state.items()}, result_file)
+    finally:
+        _destroy_distributed_if_needed()
 
 
 def _single_gpu_model_and_path(container_kind: str, dtype: torch.dtype) -> tuple[nn.Module, str]:
@@ -254,79 +259,44 @@ def run_kwarg_streaming_state(result_file: Path) -> None:
     """Write streamed kwarg/nested-output training state for pytest-side comparison."""
     if _rank() != 0:
         return
-    dtype = torch.float32
-    device = _device()
-    torch.manual_seed(20260610)
-    initial_model = KwargSandwichModel(dtype=dtype)
-    x, mask, context, y = make_kwarg_batches(dtype)
-    optimizer_kwargs = optimizer_kwargs_for("adamw")
-    criterion = nn.MSELoss()
-    streaming_model = KwargSandwichModel(dtype=dtype)
-    streaming_model.load_state_dict(initial_model.state_dict(), strict=True)
-    engine = apply_cpu_streaming_(
-        streaming_model,
-        "decoder.layers",
-        offload_policy=True,
-        optimizer_cls=torch.optim.AdamW,
-        optimizer_kwargs=optimizer_kwargs,
-        max_grad_norm=0.4,
-        device=device,
-        auto_init_process_group=False,
-        wrap_ddp=False,
-    )
-    assert isinstance(streaming_model.decoder.layers, CPUStreamingModuleList)
-    for _ in range(2):
-        engine.zero_grad(set_to_none=True)
-        loss = criterion(engine.model(x.to(device), mask.to(device), context.to(device), scale=0.7), y.to(device))
-        loss.backward()
-        engine.step()
-    closed = engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
-    assert closed is not None
-    torch.save({key: value.detach().cpu() for key, value in closed.state_dict().items()}, result_file)
+    _init_distributed_if_needed()
+    try:
+        dtype = torch.float32
+        device = _device()
+        torch.manual_seed(20260610)
+        initial_model = KwargSandwichModel(dtype=dtype)
+        x, mask, context, y = make_kwarg_batches(dtype)
+        optimizer_kwargs = optimizer_kwargs_for("adamw")
+        criterion = nn.MSELoss()
+        streaming_model = KwargSandwichModel(dtype=dtype)
+        streaming_model.load_state_dict(initial_model.state_dict(), strict=True)
+        engine = apply_cpu_streaming_(
+            streaming_model,
+            "decoder.layers",
+            offload_policy=True,
+            optimizer_cls=torch.optim.AdamW,
+            optimizer_kwargs=optimizer_kwargs,
+            max_grad_norm=0.4,
+            device=device,
+        )
+        assert isinstance(streaming_model.decoder.layers, CPUStreamingModuleList)
+        for _ in range(2):
+            engine.zero_grad(set_to_none=True)
+            loss = criterion(engine.model(x.to(device), mask.to(device), context.to(device), scale=0.7), y.to(device))
+            loss.backward()
+            engine.step()
+        closed = engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
+        assert closed is not None
+        torch.save({key: value.detach().cpu() for key, value in closed.state_dict().items()}, result_file)
+    finally:
+        _destroy_distributed_if_needed()
 
 
 def run_transfer_timing(result_file: Path) -> None:
     """Verify CUDA transfer timing records streamed parameter and gradient copies."""
     if _rank() != 0:
         return
-    device = _device()
-    model = SandwichModel(dtype=torch.float32)
-    engine = apply_cpu_streaming_(
-        model,
-        "layers",
-        offload_policy=True,
-        optimizer_cls=torch.optim.AdamW,
-        optimizer_kwargs=optimizer_kwargs_for("adamw"),
-        device=device,
-        auto_init_process_group=False,
-        wrap_ddp=False,
-        collect_timing=True,
-    )
-
-    criterion = nn.MSELoss()
-    x = torch.randn(4, 5, device=device)
-    y = torch.randn(4, 3, device=device)
-    engine.zero_grad(set_to_none=True)
-    loss = criterion(engine.model(x), y)
-    loss.backward()
-    engine.step()
-
-    timings = engine.transfer_timing_summary(synchronize=True)
-    closed = engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
-    assert closed is not None
-
-    for kind in ("state_h2d", "grad_d2h", "optimizer_param_h2d", "optimizer_param_d2h"):
-        assert kind in timings
-        assert timings[kind]["calls"] > 0
-        assert timings[kind]["bytes"] > 0
-        assert timings[kind]["enqueue_ms"] >= 0.0
-    assert any(handle._prefetch_streams for handle in engine.handles)
-    torch.save({"ok": True}, result_file)
-
-
-def run_shared_cpu_storage(result_file: Path) -> None:
-    """Verify CUDA torchrun ranks share offloaded CPU master storage through /dev/shm."""
-    dist.init_process_group(backend="nccl")
+    _init_distributed_if_needed()
     try:
         device = _device()
         model = SandwichModel(dtype=torch.float32)
@@ -337,8 +307,48 @@ def run_shared_cpu_storage(result_file: Path) -> None:
             optimizer_cls=torch.optim.AdamW,
             optimizer_kwargs=optimizer_kwargs_for("adamw"),
             device=device,
-            auto_init_process_group=False,
-            wrap_ddp=False,
+            collect_timing=True,
+        )
+
+        criterion = nn.MSELoss()
+        x = torch.randn(4, 5, device=device)
+        y = torch.randn(4, 3, device=device)
+        engine.zero_grad(set_to_none=True)
+        loss = criterion(engine.model(x), y)
+        loss.backward()
+        engine.step()
+
+        timings = engine.transfer_timing_summary(synchronize=True)
+        closed = engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
+        assert closed is not None
+
+        for kind in ("state_h2d", "grad_d2h", "optimizer_param_h2d", "optimizer_param_d2h"):
+            assert kind in timings
+            assert timings[kind]["calls"] > 0
+            assert timings[kind]["bytes"] > 0
+            assert timings[kind]["enqueue_ms"] >= 0.0
+        assert any(handle._prefetch_streams for handle in engine.handles)
+        torch.save({"ok": True}, result_file)
+    finally:
+        _destroy_distributed_if_needed()
+
+
+def run_shared_cpu_storage(result_file: Path) -> None:
+    """Verify CUDA torchrun ranks share offloaded CPU master storage through /dev/shm."""
+    device = _device()
+    try:
+        dist.init_process_group(backend="nccl", device_id=device)
+    except TypeError:
+        dist.init_process_group(backend="nccl")
+    try:
+        model = SandwichModel(dtype=torch.float32)
+        engine = apply_cpu_streaming_(
+            model,
+            "layers",
+            offload_policy=True,
+            optimizer_cls=torch.optim.AdamW,
+            optimizer_kwargs=optimizer_kwargs_for("adamw"),
+            device=device,
         )
         first_parameter = next(iter(engine.handles[0].parameters_by_name.values()))
         shared_dir = engine.config.shared_cpu_dir
@@ -387,7 +397,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("case")
     parser.add_argument("--result-file", required=True, type=Path)
-    parser.add_argument("--pin-cpu-masters", default="eager")
     parser.add_argument("--container-kind", default="modulelist")
     parser.add_argument("--optimizer-name", default="adamw")
     parser.add_argument("--max-grad-norm", type=float)
@@ -411,7 +420,6 @@ def main() -> None:
             container_kind=args.container_kind,
             optimizer_name=args.optimizer_name,
             max_grad_norm=args.max_grad_norm,
-            pin_cpu_masters=False if args.pin_cpu_masters == "false" else args.pin_cpu_masters,
             resident_suffix_count=args.resident_suffix_count,
         )
     elif args.case == "kwarg-reference-state":

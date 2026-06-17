@@ -10,11 +10,11 @@ The model remains the model the user wrote.  The transformation replaces only th
 
 ## Intended torchrun shape
 
-The implementation assumes the common `torchrun` layout: one process owns one GPU.  Each process forwards only its local batch.  The training loop is responsible for moving input tensors to the process-local device.
+The implementation requires the common `torchrun` layout, including one-GPU runs: one process owns one GPU and every process has an initialized `torch.distributed` process group.  Each process forwards only its local batch.  The training loop is responsible for moving input tensors to the process-local device.
 
-When a distributed process group is active and `wrap_ddp=True`, the engine wraps the transformed model in `torch.nn.parallel.DistributedDataParallel`.  This automatically handles resident parameters.  Offloaded parameters are hidden from the module tree, so DDP does not see them; the engine explicitly averages their gradients and dispatches their optimizer steps.
+The engine always wraps the transformed model in `torch.nn.parallel.DistributedDataParallel`.  This automatically handles resident parameters.  Offloaded parameters are hidden from the module tree, so DDP does not see them; the engine explicitly averages their gradients and dispatches their optimizer steps.
 
-Distributed offloaded CPU state assumes all ranks are on the same host.  In that case, offloaded CPU master weights, reduced gradients, and optimizer-state tensor storage are mandatory file-backed shared memory under `/dev/shm`.  If ranks report different hostnames, or a configured shared-memory directory does not resolve under `/dev/shm`, initialization fails.  Single-process training keeps the ordinary in-process CPU-master path.
+Offloaded CPU state assumes all ranks are on the same host.  Offloaded CPU master weights, reduced gradients, and optimizer-state tensor storage are mandatory file-backed shared memory under `/dev/shm`, even for one-rank runs.  If ranks report different hostnames, or a configured shared-memory directory does not resolve under `/dev/shm`, initialization fails.
 
 ## What is streamed
 
@@ -118,7 +118,7 @@ Run the suite with:
 PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
 ```
 
-In this CPU-only environment the CUDA cases skip automatically.  The suite includes single-process equivalence tests, mixed resident/offloaded tests, nested `decoder.layers` transformation tests, arbitrary `*args`/`**kwargs` and nested-output tests, prefetch-scheduling tests, shared `/dev/shm` storage tests, and real DDP equivalence checks using Gloo on CPU or NCCL on CUDA. CUDA tests launch their CUDA workers with `torchrun`, including one-process CUDA cases.
+In this CPU-only environment the CUDA cases skip automatically.  The suite includes torchrun-backed equivalence tests, mixed resident/offloaded tests, nested `decoder.layers` transformation tests, arbitrary `*args`/`**kwargs` and nested-output tests, transfer-timing tests, shared `/dev/shm` storage tests, and NCCL-backed multi-GPU equivalence checks. CUDA tests launch their CUDA workers with `torchrun`, including one-process CUDA cases.
 
 For distributed memory studies, prefer proportional set size from `/proc/self/smaps_rollup`; RSS counts shared pages in every rank and will overstate the physical CPU footprint of shared offloaded state.
 
