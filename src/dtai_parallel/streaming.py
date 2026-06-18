@@ -229,6 +229,13 @@ class _Tree:
         shared_cpu_store: "_SharedCpuStore",
         shared_key: str = "optimizer_state",
     ) -> Any:
+        """Copy an optimizer-state tree into persistent shared CPU slots.
+
+        Tensor leaves use ``shared_key`` plus their container path as a logical
+        storage identity.  Repeated calls for the same optimizer state leaf
+        intentionally overwrite and return aliases of that same shared slot; the
+        optimizer path must not retain those aliases as pre-update snapshots.
+        """
         if torch.is_tensor(value):
             out = shared_cpu_store.tensor_like(shared_key, value.detach())
             byte_count = _tensor_nbytes(value)
@@ -691,6 +698,20 @@ class _SharedCpuStore:
     buffer, gradient, and optimizer-state tensor storage.  The store validates
     that ranks are colocated on one host, creates or adopts the shared-memory
     directory, and hands out tensor views backed by named files.
+
+    Key protocol:
+    * A key names one logical mutable storage slot, not one temporary tensor
+      value.  Reusing a key with the same dtype, shape, and stride returns a
+      view of the same underlying bytes in this process.
+    * If two same-shaped values must be live independently, they need distinct
+      keys or an explicit private clone.  Holding a tensor returned by this
+      store is holding a live alias, not a snapshot.
+    * Reusing a key with a different tensor spec is an error.  That would mean
+      the caller is using one logical storage identity for incompatible values.
+    * ``release_tensor`` removes the store's mapping and unlinks the file name,
+      but existing tensor references may keep the mapping alive.  Callers must
+      clear references such as ``parameter.grad`` before treating a released key
+      as dead.
     """
 
     _SHM_ROOT = os.path.realpath("/dev/shm")
@@ -762,6 +783,12 @@ class _SharedCpuStore:
         dist.barrier(group=self.process_group)
 
     def tensor_like(self, key: str, like: Tensor) -> Tensor:
+        """Return a CPU tensor view backed by the shared slot named by ``key``.
+
+        ``like`` supplies only the tensor spec: dtype, shape, stride, and byte
+        size.  Its contents are not copied.  Same key plus same spec aliases the
+        existing slot; callers that need a snapshot must clone explicitly.
+        """
         reference = like.detach()
         nbytes = max(1, _tensor_nbytes(reference))
         shape = tuple(reference.shape)
@@ -793,12 +820,24 @@ class _SharedCpuStore:
         )
 
     def copy_tensor(self, key: str, source: Tensor, *, initialize: bool) -> Tensor:
+        """Return the shared slot for ``key`` and optionally initialize it.
+
+        Initialization writes into the shared slot.  It does not make future
+        calls independent; later ``tensor_like`` or ``copy_tensor`` calls for
+        the same key/spec alias this storage.
+        """
         shared = self.tensor_like(key, source)
         if initialize:
             shared.copy_(source.detach().to(device=torch.device("cpu")), non_blocking=False)
         return shared
 
     def release_tensor(self, key: str) -> None:
+        """Drop this store's handle to ``key`` and unlink its shared-memory file.
+
+        Any live tensor views returned earlier can keep the mapping alive.  The
+        engine therefore releases only gradient slots whose semantic lifetime
+        has ended and clears ``parameter.grad`` before reuse.
+        """
         self._storages.pop(key, None)
         self._storage_specs.pop(key, None)
         path = os.path.join(self.directory, self._safe_name(key))
@@ -989,6 +1028,9 @@ class _OffloadedModuleHandle:
         return self._shared_key("local_gradient", str(_rank(self.process_group)), name)
 
     def _copy_to_shared_gradient(self, name: str, source: Tensor, *, kind: str) -> Tensor:
+        # ``gradient.<param>`` is the owner-rank reduced-gradient slot for one
+        # optimizer step.  It is overwritten only after reduction has produced
+        # the value consumed by optimizer_step(), then released after the step.
         shared = self.shared_cpu_store.tensor_like(self._shared_key("gradient", name), source.detach())
         byte_count = _tensor_nbytes(source)
 
@@ -1001,6 +1043,9 @@ class _OffloadedModuleHandle:
         return self.metrics.record_copy(kind, byte_count, source.device, copy_fn)
 
     def _copy_to_local_shared_gradient(self, name: str, source: Tensor, *, kind: str) -> Tensor:
+        # ``local_gradient.<rank>.<param>`` is one mutable accumulation slot for
+        # this rank and parameter.  Accumulation reads the previous slot value
+        # before overwriting it with the new accumulated gradient.
         shared = self.shared_cpu_store.tensor_like(self._local_gradient_key(name), source.detach())
         byte_count = _tensor_nbytes(source)
 
@@ -1021,6 +1066,9 @@ class _OffloadedModuleHandle:
             self.shared_cpu_store.release_tensor(self._local_gradient_key(name))
 
     def _share_module_cpu_state_(self) -> None:
+        # Parameter and buffer keys are persistent model-state slots.  The module
+        # tensors are deliberately installed as aliases of those slots so all
+        # ranks and future streaming copies observe the current CPU master.
         initialize = _rank(self.process_group) == 0
         for name, parameter in self.module.named_parameters(recurse=True):
             shared = self.shared_cpu_store.copy_tensor(
@@ -1052,6 +1100,9 @@ class _OffloadedModuleHandle:
         self.wait_optimizer_commit()
         self._grad_norms_by_name = {}
         if set_to_none:
+            # Gradient keys are per-step mutable slots.  Release their shared
+            # file names only at a step boundary, then clear parameter.grad so
+            # the engine no longer retains the old aliases.
             self._release_shared_gradients(self.parameters_by_name.keys())
             self._release_local_shared_gradients(self.parameters_by_name.keys())
         for parameter in self.parameters_by_name.values():
@@ -1279,6 +1330,14 @@ class _OffloadedModuleHandle:
         staged_parameters: List[nn.Parameter],
         optimizer: Optional[torch.optim.Optimizer],
     ) -> None:
+        """Copy updated parameters and optimizer state back to shared CPU slots.
+
+        Optimizer-state tensor keys are persistent state slots.  Reusing those
+        keys is correct because the old state has already been copied to the
+        temporary optimizer on device, and after ``optimizer.step()`` the CPU
+        slot should hold the updated state rather than a snapshot of the old
+        value.
+        """
         for (name, cpu_parameter), staged in zip(named_parameters, staged_parameters):
             byte_count = _tensor_nbytes(staged)
 
@@ -1320,6 +1379,8 @@ class _OffloadedModuleHandle:
         directly for the CPU masters.  The handle gathers those gradients by
         parameter name, merges them with any prior accumulation for the local
         rank, and writes them back to shared CPU storage for the later reduction.
+        The local shared-gradient key is therefore a single accumulation slot;
+        the previous value is copied out before the slot is overwritten.
         """
 
         with self._lock:
@@ -1355,7 +1416,9 @@ class _OffloadedModuleHandle:
         parameters are hidden from DDP, so their gradients are explicitly
         all-reduced here.  After the mean is computed, non-owner ranks discard
         their copy and the owner rank keeps the reduced gradient for its optimizer
-        update.
+        update.  The reduced shared-gradient key has step scope: once the
+        optimizer has copied it to device and stepped, optimizer_step() clears
+        ``parameter.grad`` and releases the key before the next step.
         """
 
         if self.local_device.type == "cuda":
@@ -1460,6 +1523,11 @@ class _OffloadedModuleHandle:
         optimizer algorithm remains PyTorch's implementation; after it runs, the
         resulting parameter tensors and optimizer-state tensor leaves are copied
         back into shared CPU storage for the next training step.
+
+        Shared gradient aliases do not survive as live engine state past this
+        method: every ``parameter.grad`` is cleared before the reduced-gradient
+        keys are released.  External code should clone gradients before this
+        call if it needs snapshots.
         """
 
         self.clear_prefetch()
@@ -1887,6 +1955,16 @@ class CPUStreamingEngine:
     resident optimizer, the offloaded stage handles, transfer metrics, and the
     materialization path that turns the transformed model back into ordinary
     PyTorch modules.
+
+    External protocol:
+    * Treat offloaded parameters, buffers, gradients, and optimizer state as
+      engine-owned live aliases while the engine is active.
+    * Do not retain references to shared gradient tensors across ``zero_grad``
+      or ``step``.  They are mutable step-scoped slots and may be overwritten or
+      released.
+    * If caller code needs to inspect a value later, clone it at the time of
+      observation.  A detached reference to a shared tensor is still a live alias
+      of the same shared storage, not a snapshot.
     """
 
     def __init__(
