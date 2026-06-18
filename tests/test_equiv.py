@@ -94,6 +94,23 @@ def test_single_gpu_resident_suffix_matches_single_process_reference() -> None:
     assert_state_dicts_equal(stream_state, ref_state)
 
 
+def test_single_gpu_gradient_accumulation_matches_single_process_reference() -> None:
+    """Compare streamed gradient accumulation against ordinary one-GPU training."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        pytest.skip("needs at least one CUDA device")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ref_file = os.path.join(tmpdir, "ref.pt")
+        stream_file = os.path.join(tmpdir, "stream.pt")
+        _run_state("gradient-accumulation-reference-state", ref_file, nproc_per_node=1)
+        _run_state("gradient-accumulation-streaming-state", stream_file, nproc_per_node=1)
+
+        ref_state = _load_state(ref_file)
+        stream_state = _load_state(stream_file)
+
+    assert_state_dicts_close(stream_state, ref_state, dtype=torch.float32)
+
+
 def test_kwarg_streaming_matches_single_process_reference() -> None:
     """Compare streamed kwargs and nested outputs against ordinary one-GPU training."""
     if not torch.cuda.is_available() or torch.cuda.device_count() < 1:

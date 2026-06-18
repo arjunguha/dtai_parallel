@@ -223,6 +223,67 @@ def run_single_gpu_streaming_state(
         _destroy_distributed_if_needed()
 
 
+def run_gradient_accumulation_reference_state(result_file: Path) -> None:
+    """Write ordinary one-GPU training state with accumulated microbatches."""
+    if _rank() != 0:
+        return
+    dtype = torch.float32
+    device = _device()
+    torch.manual_seed(20260610)
+    model = SandwichModel(dtype=dtype).to(device)
+    xs_cpu, ys_cpu = make_batches(world_size=4, dtype=dtype)
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs_for("adamw"))
+    criterion = nn.MSELoss()
+    accumulation_steps = 2
+    for step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch in range(accumulation_steps):
+            index = step * accumulation_steps + microbatch
+            loss = criterion(model(xs_cpu[index].to(device)), ys_cpu[index].to(device)) / float(accumulation_steps)
+            loss.backward()
+        clip_grad_norm_(model.parameters(), 0.45, foreach=False)
+        optimizer.step()
+    torch.save({key: value.detach().cpu() for key, value in model.state_dict().items()}, result_file)
+
+
+def run_gradient_accumulation_streaming_state(result_file: Path) -> None:
+    """Write streamed one-GPU training state with accumulated microbatches."""
+    if _rank() != 0:
+        return
+    _init_distributed_if_needed()
+    try:
+        dtype = torch.float32
+        device = _device()
+        torch.manual_seed(20260610)
+        model = SandwichModel(dtype=dtype)
+        xs_cpu, ys_cpu = make_batches(world_size=4, dtype=dtype)
+        engine = apply_cpu_streaming_(
+            model,
+            "layers",
+            offload_policy=[True, False, True],
+            optimizer_cls=torch.optim.AdamW,
+            optimizer_kwargs=optimizer_kwargs_for("adamw"),
+            max_grad_norm=0.45,
+            device=device,
+        )
+        criterion = nn.MSELoss()
+        accumulation_steps = 2
+        for step in range(2):
+            engine.zero_grad(set_to_none=True)
+            for microbatch in range(accumulation_steps):
+                index = step * accumulation_steps + microbatch
+                loss = criterion(engine.model(xs_cpu[index].to(device)), ys_cpu[index].to(device)) / float(
+                    accumulation_steps
+                )
+                loss.backward()
+            engine.step()
+        closed = engine.close(return_on_all_ranks=True, device=torch.device("cpu"))
+        assert closed is not None
+        torch.save({key: value.detach().cpu() for key, value in closed.state_dict().items()}, result_file)
+    finally:
+        _destroy_distributed_if_needed()
+
+
 def _single_gpu_model_and_path(container_kind: str, dtype: torch.dtype) -> tuple[nn.Module, str]:
     """Build the small model variant used by one-GPU equivalence cases."""
     if container_kind == "modulelist":
@@ -428,6 +489,10 @@ def main() -> None:
             max_grad_norm=args.max_grad_norm,
             resident_suffix_count=args.resident_suffix_count,
         )
+    elif args.case == "gradient-accumulation-reference-state":
+        run_gradient_accumulation_reference_state(args.result_file)
+    elif args.case == "gradient-accumulation-streaming-state":
+        run_gradient_accumulation_streaming_state(args.result_file)
     elif args.case == "kwarg-reference-state":
         run_kwarg_reference_state(args.result_file)
     elif args.case == "kwarg-streaming-state":
