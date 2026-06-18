@@ -105,6 +105,52 @@ def _streaming_ddp_state(
         _destroy_distributed_if_needed()
 
 
+def _streaming_ddp_accumulation_state(
+    initial_state: Mapping[str, Tensor],
+    xs_cpu: Sequence[Tensor],
+    ys_cpu: Sequence[Tensor],
+    *,
+    accumulation_steps: int,
+    max_grad_norm: Optional[float],
+    steps: int,
+) -> Mapping[str, Tensor] | None:
+    """Train streamed DDP with accumulated microbatches and return rank-zero state."""
+    _init_distributed_if_needed()
+    try:
+        device = _device()
+        rank = _rank()
+        world_size = _world_size()
+        model = SandwichModel(dtype=torch.float32)
+        model.load_state_dict(initial_state, strict=True)
+        engine = apply_cpu_streaming_(
+            model,
+            "layers",
+            offload_policy=[True, False, True],
+            optimizer_cls=optimizer_cls_for("adamw"),
+            optimizer_kwargs=optimizer_kwargs_for("adamw"),
+            max_grad_norm=max_grad_norm,
+            device=device,
+        )
+        assert isinstance(engine.model, DDP)
+        criterion = nn.MSELoss()
+        for step in range(steps):
+            engine.zero_grad(set_to_none=True)
+            for microbatch in range(accumulation_steps):
+                index = (step * accumulation_steps + microbatch) * world_size + rank
+                loss = criterion(engine.model(xs_cpu[index].to(device)), ys_cpu[index].to(device)) / float(
+                    accumulation_steps
+                )
+                loss.backward()
+            engine.step()
+        closed = engine.close(device=torch.device("cpu"))
+        if rank == 0:
+            assert closed is not None
+            return {key: value.detach().cpu() for key, value in closed.state_dict().items()}
+        return None
+    finally:
+        _destroy_distributed_if_needed()
+
+
 def _standard_state(
     initial_state: Mapping[str, Tensor],
     xs_cpu: Sequence[Tensor],
@@ -131,12 +177,56 @@ def _standard_state(
     return {key: value.detach().cpu() for key, value in model.state_dict().items()}
 
 
+def _standard_accumulation_state(
+    initial_state: Mapping[str, Tensor],
+    xs_cpu: Sequence[Tensor],
+    ys_cpu: Sequence[Tensor],
+    *,
+    accumulation_steps: int,
+    max_grad_norm: Optional[float],
+    steps: int,
+    world_size: int,
+) -> Mapping[str, Tensor]:
+    """Train a one-rank full-batch reference with accumulated global microbatches."""
+    device = _device()
+    model = SandwichModel(dtype=torch.float32).to(device)
+    model.load_state_dict(initial_state, strict=True)
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs_for("adamw"))
+    criterion = nn.MSELoss()
+    for step in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch in range(accumulation_steps):
+            offset = (step * accumulation_steps + microbatch) * world_size
+            x = torch.cat(list(xs_cpu[offset : offset + world_size]), dim=0)
+            y = torch.cat(list(ys_cpu[offset : offset + world_size]), dim=0)
+            loss = criterion(model(x.to(device)), y.to(device)) / float(accumulation_steps)
+            loss.backward()
+        if max_grad_norm is not None:
+            clip_grad_norm_(model.parameters(), max_grad_norm, foreach=False)
+        optimizer.step()
+    return {key: value.detach().cpu() for key, value in model.state_dict().items()}
+
+
 def _deterministic_inputs() -> tuple[Mapping[str, Tensor], Sequence[Tensor], Sequence[Tensor]]:
     """Create identical initial model state and batches for separate torchrun jobs."""
     dtype = torch.float32
     torch.manual_seed(20260610)
     initial_model = SandwichModel(dtype=dtype)
     xs_cpu, ys_cpu = make_batches(world_size=2, dtype=dtype)
+    return initial_model.state_dict(), xs_cpu, ys_cpu
+
+
+def _deterministic_accumulation_inputs(
+    *,
+    steps: int,
+    accumulation_steps: int,
+    world_size: int,
+) -> tuple[Mapping[str, Tensor], Sequence[Tensor], Sequence[Tensor]]:
+    """Create initial state and per-rank microbatches for accumulation checks."""
+    dtype = torch.float32
+    torch.manual_seed(20260610)
+    initial_model = SandwichModel(dtype=dtype)
+    xs_cpu, ys_cpu = make_batches(world_size=steps * accumulation_steps * world_size, dtype=dtype)
     return initial_model.state_dict(), xs_cpu, ys_cpu
 
 
@@ -155,6 +245,53 @@ def run_standard_state(result_file: Path) -> None:
         return
     initial_state, xs_cpu, ys_cpu = _deterministic_inputs()
     state = _standard_state(initial_state, xs_cpu, ys_cpu, max_grad_norm=0.5, steps=2)
+    torch.save(state, result_file)
+
+
+def run_streaming_ddp_accumulation_state(result_file: Path) -> None:
+    """Write the streamed DDP accumulation state for pytest-side comparison."""
+    steps = 2
+    accumulation_steps = 2
+    world_size = 2
+    initial_state, xs_cpu, ys_cpu = _deterministic_accumulation_inputs(
+        steps=steps,
+        accumulation_steps=accumulation_steps,
+        world_size=world_size,
+    )
+    state = _streaming_ddp_accumulation_state(
+        initial_state,
+        xs_cpu,
+        ys_cpu,
+        accumulation_steps=accumulation_steps,
+        max_grad_norm=0.45,
+        steps=steps,
+    )
+    if _rank() == 0:
+        assert state is not None
+        torch.save(state, result_file)
+
+
+def run_standard_accumulation_state(result_file: Path) -> None:
+    """Write the one-rank accumulated full-batch reference state."""
+    if _rank() != 0:
+        return
+    steps = 2
+    accumulation_steps = 2
+    world_size = 2
+    initial_state, xs_cpu, ys_cpu = _deterministic_accumulation_inputs(
+        steps=steps,
+        accumulation_steps=accumulation_steps,
+        world_size=world_size,
+    )
+    state = _standard_accumulation_state(
+        initial_state,
+        xs_cpu,
+        ys_cpu,
+        accumulation_steps=accumulation_steps,
+        max_grad_norm=0.45,
+        steps=steps,
+        world_size=world_size,
+    )
     torch.save(state, result_file)
 
 
@@ -474,6 +611,10 @@ def main() -> None:
         run_streaming_ddp_state(args.result_file)
     elif args.case == "standard-state":
         run_standard_state(args.result_file)
+    elif args.case == "streaming-ddp-accumulation-state":
+        run_streaming_ddp_accumulation_state(args.result_file)
+    elif args.case == "standard-accumulation-state":
+        run_standard_accumulation_state(args.result_file)
     elif args.case == "single-gpu-reference-state":
         run_single_gpu_reference_state(
             args.result_file,

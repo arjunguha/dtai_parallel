@@ -143,3 +143,20 @@ def test_streamed_modulelist_inside_larger_model_matches_standard_training_loop(
         stream_state = _load_state(stream_file)
 
     assert_state_dicts_close(stream_state, ref_state, dtype=torch.float32)
+
+
+def test_two_rank_gradient_accumulation_matches_standard_training_loop() -> None:
+    """Compare two-rank streamed gradient accumulation against full-batch CUDA."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("needs at least two CUDA devices")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ref_file = os.path.join(tmpdir, "ref.pt")
+        stream_file = os.path.join(tmpdir, "stream.pt")
+        _run_state("standard-accumulation-state", ref_file, nproc_per_node=1)
+        _run_state("streaming-ddp-accumulation-state", stream_file, nproc_per_node=2)
+
+        ref_state = _load_state(ref_file)
+        stream_state = _load_state(stream_file)
+
+    assert_state_dicts_close(stream_state, ref_state, dtype=torch.float32)

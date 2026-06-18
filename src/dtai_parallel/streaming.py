@@ -673,6 +673,34 @@ def _all_reduce_mean_(tensor: Tensor, local_device: torch.device, process_group:
     return work
 
 
+def _reduce_mean_to_owner(
+    tensor: Tensor,
+    *,
+    owner_rank: int,
+    local_device: torch.device,
+    process_group: Optional[Any],
+) -> Optional[Tensor]:
+    """Average a tensor across ranks and return it only on ``owner_rank``.
+
+    Offloaded CUDA gradients are reduced as soon as backward replay produces
+    them, then accumulated only on the rank that owns the stage optimizer.  This
+    keeps non-owner ranks from materializing full-model CPU gradient slots while
+    preserving the same global mean used by the previous post-backward allreduce.
+    """
+
+    _require_process_group(process_group)
+    original_device = tensor.device
+    comm_device = _collective_tensor_device(tensor, local_device, process_group)
+    work = tensor.detach().to(comm_device, non_blocking=True).clone()
+    dist.reduce(work, dst=int(owner_rank), op=dist.ReduceOp.SUM, group=process_group)
+    if _rank(process_group) != int(owner_rank):
+        return None
+    work.div_(float(dist.get_world_size(process_group)))
+    if work.device != original_device:
+        work = work.to(original_device, non_blocking=original_device.type != "cpu")
+    return work
+
+
 def _broadcast_tensor_(tensor: Tensor, src: int, local_device: torch.device, process_group: Optional[Any]) -> None:
     """Broadcast an updated master tensor into every rank's local view.
 
@@ -1376,35 +1404,52 @@ class _OffloadedModuleHandle:
         """Accumulate gradients produced by this rank's backward replay.
 
         Backward replay computes gradients for the streamed parameter copies, not
-        directly for the CPU masters.  The handle gathers those gradients by
-        parameter name, merges them with any prior accumulation for the local
-        rank, and writes them back to shared CPU storage for the later reduction.
-        The local shared-gradient key is therefore a single accumulation slot;
-        the previous value is copied out before the slot is overwritten.
+        directly for the CPU masters.  CUDA runs reduce each parameter gradient
+        to its stage owner immediately and accumulate only the owner-rank
+        reduced slot.  This avoids keeping one full local gradient copy per rank
+        alive across microbatches once persistent optimizer state exists.  CPU
+        runs keep the older local accumulation path and reduce at step time.
         """
 
         with self._lock:
             parameters = self.parameters_by_name
-            for name, grad in grads_by_name.items():
-                if grad is None:
-                    continue
-                target = parameters[name]
-                if grad.device.type == "cuda" and self.local_device.type == "cuda":
-                    grad_detached = grad.detach()
+            if self.local_device.type == "cuda":
+                rank = _rank(self.process_group)
+                for name, grad in grads_by_name.items():
+                    if grad is None:
+                        continue
+                    target = parameters[name]
+                    reduced = _reduce_mean_to_owner(
+                        grad.detach(),
+                        owner_rank=self.owner_rank,
+                        local_device=self.local_device,
+                        process_group=self.process_group,
+                    )
+                    if rank != self.owner_rank:
+                        target.grad = None
+                        continue
+                    if reduced is None:
+                        raise RuntimeError("owner rank did not receive reduced gradient")
                     if target.grad is None:
-                        accumulated = grad_detached
+                        accumulated = reduced
                     else:
                         accumulated = _copy_tensor_to_device(
                             target.grad.detach(),
-                            grad_detached.device,
+                            reduced.device,
                             metrics=self.metrics,
                             kind="grad_accum_h2d",
                             pinned_transfer_buffer=self.pinned_transfer_buffer,
                         )
-                        accumulated.add_(grad_detached)
+                        accumulated.add_(reduced)
                     self._record_grad_norm(name, accumulated, norm_type=self.grad_norm_type)
-                    target.grad = self._copy_to_local_shared_gradient(name, accumulated, kind="grad_d2h")
-                elif target.grad is None:
+                    target.grad = self._copy_to_shared_gradient(name, accumulated, kind="grad_d2h")
+                return
+
+            for name, grad in grads_by_name.items():
+                if grad is None:
+                    continue
+                target = parameters[name]
+                if target.grad is None:
                     target.grad = grad.detach().clone()
                 else:
                     target.grad.add_(grad.detach())
@@ -1422,23 +1467,9 @@ class _OffloadedModuleHandle:
         """
 
         if self.local_device.type == "cuda":
-            for name, parameter in self.parameters_by_name.items():
-                if parameter.grad is None:
-                    continue
-                staged_grad = _copy_tensor_to_device(
-                    parameter.grad.detach(),
-                    self.local_device,
-                    metrics=self.metrics,
-                    kind="grad_reduce_h2d",
-                    pinned_transfer_buffer=self.pinned_transfer_buffer,
-                )
-                reduced = _all_reduce_mean_(staged_grad, self.local_device, self.process_group).detach()
-                self._record_grad_norm(name, reduced, norm_type=self.grad_norm_type)
-                if _rank(self.process_group) == self.owner_rank:
-                    parameter.grad = self._copy_to_shared_gradient(name, reduced, kind="grad_reduce_d2h")
-                else:
-                    parameter.grad = None
-                self._release_local_shared_gradients((name,))
+            # CUDA gradients have already been reduced to owner ranks during
+            # backward replay.  There are no per-rank local_gradient slots to
+            # reduce or release at the step boundary.
             return
 
         for name, parameter in self.parameters_by_name.items():
@@ -2054,17 +2085,27 @@ class CPUStreamingEngine:
             handle.zero_grad(set_to_none=set_to_none)
 
     def _cuda_total_grad_norm(self) -> Tensor:
-        norms: List[Optional[Tensor]] = []
+        offloaded_norms: List[Optional[Tensor]] = []
         for handle in self.handles:
-            norms.append(handle.offloaded_grad_norm(device=self.local_device, norm_type=self.grad_norm_type))
+            offloaded_norms.append(handle.offloaded_grad_norm(device=self.local_device, norm_type=self.grad_norm_type))
+        offloaded_norm = _combine_grad_norms(offloaded_norms, norm_type=self.grad_norm_type, device=self.local_device)
+        if _world_size(self.process_group) > 1:
+            if self.grad_norm_type == float("inf"):
+                dist.all_reduce(offloaded_norm, op=dist.ReduceOp.MAX, group=self.process_group)
+            else:
+                powered = offloaded_norm.pow(self.grad_norm_type)
+                dist.all_reduce(powered, op=dist.ReduceOp.SUM, group=self.process_group)
+                offloaded_norm = powered.pow(1.0 / self.grad_norm_type)
+
+        resident_norm: Optional[Tensor] = None
         if self.resident_optimizer is not None:
             resident_gradients: List[Tensor] = []
             for group in self.resident_optimizer.param_groups:
                 for parameter in group["params"]:
                     if parameter.grad is not None:
                         resident_gradients.append(parameter.grad)
-            norms.append(_grad_total_norm(resident_gradients, norm_type=self.grad_norm_type, device=self.local_device))
-        return _combine_grad_norms(norms, norm_type=self.grad_norm_type, device=self.local_device)
+            resident_norm = _grad_total_norm(resident_gradients, norm_type=self.grad_norm_type, device=self.local_device)
+        return _combine_grad_norms((offloaded_norm, resident_norm), norm_type=self.grad_norm_type, device=self.local_device)
 
     def _scale_resident_gradients_(self, clip_coef: Tensor) -> None:
         if self.resident_optimizer is None:
