@@ -353,6 +353,11 @@ def run_shared_cpu_storage(result_file: Path) -> None:
         first_parameter = next(iter(engine.handles[0].parameters_by_name.values()))
         shared_dir = engine.config.shared_cpu_dir
         assert shared_dir is not None
+        reuse_key = f"mapping_reuse_rank_{_rank()}"
+        reuse_first = engine.shared_cpu_store.tensor_like(reuse_key, torch.empty(8, dtype=torch.float32))
+        reuse_second = engine.shared_cpu_store.tensor_like(reuse_key, torch.empty(8, dtype=torch.float32))
+        reused_mapping = reuse_first.data_ptr() == reuse_second.data_ptr()
+        engine.shared_cpu_store.release_tensor(reuse_key)
         if _rank() == 0:
             first_parameter.data.fill_(123.0)
         dist.barrier()
@@ -381,6 +386,7 @@ def run_shared_cpu_storage(result_file: Path) -> None:
                 "observed": observed,
                 "is_shm": os.path.commonpath([os.path.realpath("/dev/shm"), os.path.realpath(shared_dir)])
                 == os.path.realpath("/dev/shm"),
+                "reused_mapping": reused_mapping,
                 "gradient_files_remaining": [path for path in gradient_paths if os.path.exists(path)],
                 "local_gradient_files_remaining": [path for path in local_gradient_paths if os.path.exists(path)],
             },

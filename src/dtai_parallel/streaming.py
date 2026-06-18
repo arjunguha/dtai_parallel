@@ -700,6 +700,7 @@ class _SharedCpuStore:
         self.process_group = process_group
         self.created_by_engine = bool(created_by_engine)
         self._storages: Dict[str, torch.UntypedStorage] = {}
+        self._storage_specs: Dict[str, Tuple[int, torch.dtype, Tuple[int, ...], Tuple[int, ...]]] = {}
         os.makedirs(self.directory, exist_ok=True)
 
     @classmethod
@@ -763,14 +764,32 @@ class _SharedCpuStore:
     def tensor_like(self, key: str, like: Tensor) -> Tensor:
         reference = like.detach()
         nbytes = max(1, _tensor_nbytes(reference))
+        shape = tuple(reference.shape)
+        stride = tuple(reference.stride())
+        spec = (nbytes, reference.dtype, shape, stride)
+        storage = self._storages.get(key)
+        if storage is not None:
+            existing = self._storage_specs[key]
+            if existing != spec:
+                raise RuntimeError(
+                    f"shared CPU tensor key {key!r} changed shape, dtype, or stride: "
+                    f"existing={existing!r}, requested={spec!r}"
+                )
+            return torch.empty((), dtype=reference.dtype, device=torch.device("cpu")).set_(
+                storage,
+                0,
+                shape,
+                stride,
+            )
         path = os.path.join(self.directory, self._safe_name(key))
         storage = torch.UntypedStorage.from_file(path, shared=True, nbytes=nbytes)
         self._storages[key] = storage
+        self._storage_specs[key] = spec
         return torch.empty((), dtype=reference.dtype, device=torch.device("cpu")).set_(
             storage,
             0,
-            tuple(reference.shape),
-            tuple(reference.stride()),
+            shape,
+            stride,
         )
 
     def copy_tensor(self, key: str, source: Tensor, *, initialize: bool) -> Tensor:
@@ -781,6 +800,7 @@ class _SharedCpuStore:
 
     def release_tensor(self, key: str) -> None:
         self._storages.pop(key, None)
+        self._storage_specs.pop(key, None)
         path = os.path.join(self.directory, self._safe_name(key))
         try:
             os.unlink(path)

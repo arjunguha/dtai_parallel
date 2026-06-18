@@ -66,5 +66,6 @@ def test_distributed_offloaded_parameters_use_shared_cpu_storage() -> None:
     assert {result["rank"] for result in results} == {0, 1}
     assert all(result["observed"] == 123.0 for result in results)
     assert all(result["is_shm"] for result in results)
+    assert all(result["reused_mapping"] for result in results)
     assert all(not result["gradient_files_remaining"] for result in results)
     assert all(not result["local_gradient_files_remaining"] for result in results)
