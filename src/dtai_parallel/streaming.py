@@ -1141,6 +1141,35 @@ class _OffloadedModuleHandle:
             else:
                 parameter.grad.zero_()
 
+    def release_training_state(self) -> None:
+        """Release gradients, prefetched tensors, and optimizer state.
+
+        Parameter and buffer masters intentionally remain in shared CPU storage
+        so callers can serialize them without materializing a second full model
+        copy.  After this call the handle is no longer useful for training.
+        """
+
+        self.wait_optimizer_commit()
+        self.clear_prefetch()
+        self.evict_device(self.local_device)
+        self.zero_grad(set_to_none=True)
+        for name, state in list(self.optimizer_state.items()):
+            self._release_optimizer_state_tree(self._shared_key("optimizer", name), state)
+        self.optimizer_state = {}
+        self._prefetched_optimizer_step = None
+
+    def _release_optimizer_state_tree(self, shared_key: str, value: Any) -> None:
+        if torch.is_tensor(value):
+            self.shared_cpu_store.release_tensor(shared_key)
+            return
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                self._release_optimizer_state_tree(f"{shared_key}.{key}", item)
+            return
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                self._release_optimizer_state_tree(f"{shared_key}.{index}", item)
+
     def _record_grad_norm(self, name: str, grad: Tensor, *, norm_type: float) -> None:
         if not self.track_grad_norms:
             return
@@ -2221,6 +2250,62 @@ class CPUStreamingEngine:
         finally:
             _set_module_path(parent, child_name, self.streaming_container)
         return model_copy.to(target_device)
+
+    def iter_materialized_state_dict(self, device: Optional[DeviceLike] = None) -> Iterator[Tuple[str, Tensor]]:
+        """Yield the ordinary model state dict without materializing the model.
+
+        This is the checkpointing counterpart to ``materialize()``.  It exposes
+        the same state-dict names a caller would get after replacing the
+        streaming container with normal modules, but yields tensors one at a
+        time so large models can be sharded directly to disk without creating a
+        second full private CPU copy alongside the shared CPU masters.
+        """
+
+        target_device = torch.device(device) if device is not None else None
+        parent, child_name, current_child = _resolve_module_path(self.root_model, self.module_path)
+        del parent, child_name
+        if current_child is not self.streaming_container:
+            raise RuntimeError("the transformed submodule was replaced outside the streaming engine")
+
+        for handle in self.handles:
+            handle.wait_optimizer_commit()
+
+        streaming_prefix = f"{self.module_path}."
+        for name, tensor in self.root_model.state_dict().items():
+            if name.startswith(streaming_prefix):
+                continue
+            detached = tensor.detach()
+            yield name, detached if target_device is None else detached.to(target_device)
+
+        for stage_name, stage in self.streaming_container._modules.items():
+            if not isinstance(stage, _StreamingStage):
+                raise TypeError("streaming container contains an unexpected module type")
+            if stage._handle is not None:
+                stage_state = stage._handle.module.state_dict()
+            else:
+                stage_state = stage.module.state_dict()  # type: ignore[attr-defined]
+            for name, tensor in stage_state.items():
+                detached = tensor.detach()
+                yield f"{self.module_path}.{stage_name}.{name}", detached if target_device is None else detached.to(target_device)
+
+    def release_training_state_for_checkpoint(self) -> None:
+        """Free transient training state while keeping model masters alive.
+
+        This is the intended finalization step before serializing a large
+        streamed model.  It removes gradients, optimizer state, and prefetched
+        device copies, but leaves parameter and buffer shared-memory slots
+        intact so ``iter_materialized_state_dict()`` can write them directly.
+        """
+
+        dist.barrier(group=self.process_group)
+        for handle in self.handles:
+            handle.release_training_state()
+        if self.resident_optimizer is not None:
+            self.resident_optimizer.zero_grad(set_to_none=True)
+            self.resident_optimizer.state.clear()
+        if self.local_device.type == "cuda":
+            torch.cuda.empty_cache()
+        dist.barrier(group=self.process_group)
 
     def close(self, *, return_on_all_ranks: bool = False, device: Optional[DeviceLike] = None) -> Optional[nn.Module]:
         """Finish a streaming run and release the shared CPU store.
